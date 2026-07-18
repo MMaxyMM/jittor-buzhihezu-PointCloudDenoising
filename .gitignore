@@ -1,0 +1,24 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local datasets and archives
+dataset_train/
+dataset_train_pcd/
+dataset_test_noisy/
+dataset_train.tar.gz
+dataset_test_noisy.zip
+
+# Training, validation, and prediction artifacts
+experiments/
+results/
+checkpoint_selection/
+result.zip
+
+# Local environments and tooling
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+
