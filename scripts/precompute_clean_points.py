@@ -1,4 +1,72 @@
-"""Pre-sample clean point clouds from the official training meshes."""
+"""
+Pre-sample clean point clouds from the official training meshes.
+
+生成 clean.npy 缓存
+
+先进入项目目录并激活环境：
+
+  conda activate jittor2A
+  cd /root/autodl-tmp/jittor2A/starter_code
+
+  生成完整缓存
+
+  RTX 4090 对这个步骤帮助不大，主要使用 CPU。可以先用 16 个 worker：
+
+  python scripts/precompute_clean_points.py \
+    --input_dir dataset_train \
+    --output_dir dataset_train_pcd \
+    --num_points 50000 \
+    --workers 16 \
+    --seed 123
+
+  最终目录结构是：
+
+  dataset_train_pcd/
+  └── shapenet/
+      └── <synset_id>/
+          └── <model_id>/
+              └── clean.npy
+
+  如果中途停止，直接重新执行同一命令即可：
+
+  python scripts/precompute_clean_points.py \
+    --input_dir dataset_train \
+    --output_dir dataset_train_pcd \
+    --num_points 50000 \
+    --workers 16 \
+    --seed 123
+
+  #python scripts/precompute_clean_points.py --input_dir dataset_train --output_dir dataset_train_pcd --num_points 50000 --workers 16 --seed 123
+
+  已有文件会被跳过，不会重复生成。
+
+  生成后检查数量：
+
+  find dataset_train -path '*/models/model_normalized.obj' -type f | wc -l
+  find dataset_train_pcd -name clean.npy -type f | wc -l
+
+  两边应该都是 15833。
+
+  然后开始缓存版训练：
+
+  python run.py --task configs/task/train_vm_cached.yaml
+
+  如果想先快速确认训练能启动：
+
+  python run.py --task configs/task/train_vm_cached_debug.yaml
+
+  参数说明：
+
+  - --input_dir：官方 OBJ 训练集目录。
+  - --output_dir：缓存输出目录。
+  - --num_points：每个 mesh 采样点数，默认 50000。
+  - --workers：CPU 进程数，建议先试 8 或 16。
+  - --seed：随机种子；相同 seed 会生成可复现结果。
+  - --limit：只处理前 N 个模型，用于测试。
+  - --overwrite：强制覆盖已有缓存，通常不要加。
+
+
+"""
 
 import argparse
 import hashlib
