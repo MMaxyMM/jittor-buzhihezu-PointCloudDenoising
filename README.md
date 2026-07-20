@@ -20,12 +20,38 @@ python -m pip install -r requirements.txt
 - `trimesh`
 - `scipy`
 - `omegaconf`
+- `cupy-cuda11x`（normal 分支的 CUDA PCA 特征分解）
 
 如需运行 `evaluate.py` 的精确 P2S 计算，可额外安装：
 
 ```bash
 pip install point-cloud-utils
 ```
+
+## 符号不敏感 Normal 特征
+
+当前分支直接在 `configs/model/vm.yaml` 中启用局部 normal 特征：
+
+```yaml
+use_normal: true
+normal_knn: 24
+```
+
+模型在训练和预测阶段都使用 XYZ 的 24-NN 邻域计算局部协方差，并通过 GPU 批量特征分解取最小特征值对应的 PCA normal。由于 PCA normal 存在 `n` 与 `-n` 的符号歧义，网络不直接使用 `(nx, ny, nz)`，而是使用：
+
+```text
+nx², ny², nz², nx·ny, nx·nz, ny·nz
+```
+
+这些量等价于 normal 外积 `n nᵀ` 的 6 个独立分量，对 normal 翻转完全不敏感。它们与 XYZ 拼接成 9 维第一层输入；第一层 KNN 邻接仍然只按 XYZ 构建。
+
+该实现依赖与 CUDA 11.x 匹配的 CuPy：
+
+```bash
+pip install cupy-cuda11x
+```
+
+开启 normal 后，第一层输入维度由 3 变为 9，因此原始 baseline checkpoint 不能直接加载到该模型，必须重新训练。若要使用不含 normal 的原始版本，请切换回 `main` 分支。
 
 ## 数据准备
 

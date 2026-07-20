@@ -3,3 +3,4 @@ numpy
 trimesh
 scipy
 omegaconf
+cupy-cuda11x

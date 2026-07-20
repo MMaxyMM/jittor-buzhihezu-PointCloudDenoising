@@ -22,6 +22,8 @@ class VelocityModule(ModelSpec):
         cfg = self.model_config
         # geometry
         self.frame_knn = cfg['frame_knn']
+        self.use_normal = cfg.get('use_normal', False)
+        self.normal_knn = cfg.get('normal_knn', 24)
         self.num_train_points = cfg['num_train_points']
         
         # score-matching
@@ -30,8 +32,10 @@ class VelocityModule(ModelSpec):
         # networks
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
-            input_dim=3,
-            embedding_dim=cfg['feat_embedding_dim']
+            input_dim=9 if self.use_normal else 3,
+            embedding_dim=cfg['feat_embedding_dim'],
+            use_normal=self.use_normal,
+            normal_k=self.normal_knn,
         )
         
         self.decoder = Decoder(

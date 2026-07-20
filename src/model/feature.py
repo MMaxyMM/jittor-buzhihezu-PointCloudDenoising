@@ -63,13 +63,15 @@ class DynamicEdgeConv(EdgeConv):
         return super().execute(x, edge_index)
 
 class FeatureExtraction(nn.Module):
-    def __init__(self, k=32, input_dim=0, embedding_dim=512, distance_estimation=False):
+    def __init__(self, k=32, input_dim=0, embedding_dim=512, distance_estimation=False, use_normal=False, normal_k=24):
         super().__init__()
 
         self.k = k
         self.input_dim = input_dim
         self.embedding_dim = embedding_dim
         self.distance_estimation = distance_estimation
+        self.use_normal = use_normal
+        self.normal_k = normal_k
 
         self.conv1 = DynamicEdgeConv(self.input_dim, embedding_dim // 8)
         self.conv2 = DynamicEdgeConv(embedding_dim // 8, embedding_dim // 4)
@@ -101,20 +103,49 @@ class FeatureExtraction(nn.Module):
         
         return edge_index
     
+    def estimate_normal_features(self, xyz):
+        """Estimate PCA normals and return sign-invariant n n^T features."""
+        B, N, _ = xyz.shape
+        if N <= self.normal_k:
+            raise ValueError(f"normal_k must be smaller than point count, got {self.normal_k} >= {N}")
+
+        knn_idx = get_knn_idx(xyz, xyz, self.normal_k + 1)[:, :, 1:]
+        batch_idx = jt.arange(B).reshape(B, 1, 1).broadcast(knn_idx.shape)
+        neighbors = xyz[batch_idx, knn_idx]
+        centered = neighbors - neighbors.mean(dim=2, keepdims=True)
+        covariance = jt.matmul(centered.transpose(0, 1, 3, 2), centered) / float(self.normal_k)
+
+        _, eigenvectors = jt.linalg.eigh(covariance)
+        normals = eigenvectors[:, :, :, 0]
+        nx = normals[:, :, 0:1]
+        ny = normals[:, :, 1:2]
+        nz = normals[:, :, 2:3]
+        features = jt.concat([
+            nx * nx, ny * ny, nz * nz,
+            nx * ny, nx * nz, ny * nz,
+        ], dim=-1)
+        return features.stop_grad()
+
     def normalize_patch(self, pcl):
         scale = jt.sqrt((pcl ** 2).sum(-1, keepdims=True))
         scale = scale.max(dim=-2, keepdims=True)
         return pcl / (scale + 1e-8) # type: ignore
     
-    def execute(self, x):
-        # x: (B, N, C)
-        B, N, _ = x.shape
-        
+    def execute(self, xyz):
+        # xyz: (B, N, 3); geometric neighborhoods always use XYZ.
+        B, N, _ = xyz.shape
+
         if self.distance_estimation:
-            x = self.normalize_patch(x)
-        
+            xyz = self.normalize_patch(xyz)
+
+        if self.use_normal:
+            normal_features = self.estimate_normal_features(xyz)
+            x = jt.concat([xyz, normal_features], dim=-1)
+        else:
+            x = xyz
+
         # -------- conv1 --------
-        edge_index = self.get_edge_index(x)
+        edge_index = self.get_edge_index(xyz)
         x_flat = x.reshape(B * N, -1)
         
         x1 = self.conv1(x_flat, edge_index)
