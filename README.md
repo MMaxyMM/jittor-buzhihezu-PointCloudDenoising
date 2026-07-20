@@ -1,3 +1,5 @@
+注：引入normol导致了较为严重的噪声污染，分数下降至54分左右，考虑放弃此条支线
+
 # 基于 Jittor 的点云降噪 Baseline
 
 本项目用于点云降噪任务：输入含噪点云 `noisy.npy`，模型预测每个点的三维位移，并输出相同点数的 `denoised.npy`。项目保留官方 OBJ 训练流程，同时提供 clean point cloud 缓存训练流程，用于减少每个 epoch 重复解析 OBJ 和 mesh 表面采样造成的 CPU/IO 开销。
