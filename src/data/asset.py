@@ -29,6 +29,10 @@ class Asset():
         
         if self.vertices is not None:
             self.vertices = _apply(self.vertices, trans)
+        if self.sampled_vertices is not None:
+            self.sampled_vertices = _apply(self.sampled_vertices, trans)
+        if self.sampled_vertices_noisy is not None:
+            self.sampled_vertices_noisy = _apply(self.sampled_vertices_noisy, trans)
 
 class Exporter(): # a simple parser
     

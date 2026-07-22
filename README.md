@@ -350,3 +350,148 @@ result.zip
         └── <model_id>/
             └── denoised.npy
 ```
+
+
+## Jittor StraightPCF（CVM + DistanceModule）
+
+本分支补齐了 StraightPCF 的后两个训练阶段。完整训练顺序不可交换：
+
+1. 训练单个 VelocityModule（已有 baseline）。
+2. 将同一个 baseline 权重复制初始化多个 VelocityModule，联合训练 Coupled VelocityModule（CVM）。
+3. 加载训练完成的 CVM，冻结其参数，训练 DistanceModule 和最终位置损失。
+
+实现仍使用 Jittor，输入和输出点数完全相同。正式训练使用缓存 clean point cloud，但噪声、patch 和时间步仍在每次取样时动态生成。
+
+### 先运行小规模端到端验证
+
+下面两个命令各训练 1 epoch，使用 train_cached_debug 的 1000 个文件：
+
+~~~bash
+python run.py --task configs/task/train_cvm_cached_debug.yaml
+python run.py --task configs/task/train_straightpcf_cached_debug.yaml
+~~~
+
+第一个命令输出：
+
+~~~text
+experiments/cvm_debug/checkpoint_0.pkl
+~~~
+
+第二个命令通过 configs/model/straightpcf_debug.yaml 加载上述 CVM checkpoint，输出：
+
+~~~text
+experiments/straightpcf_debug/checkpoint_0.pkl
+~~~
+
+这两个 checkpoint 只用于验证代码链路，不应作为正式提交权重。
+
+### 第一阶段：准备 baseline VelocityModule
+
+默认 CVM 配置从以下文件初始化四个 VelocityModule：
+
+~~~text
+BestModel/baseline/best_checkpoint.pkl
+~~~
+
+对应配置位于 configs/model/cvm.yaml：
+
+~~~yaml
+init_velocity_ckpt: BestModel/baseline/best_checkpoint.pkl
+num_modules: 4
+~~~
+
+如果 baseline best 文件位于其他目录，请先修改 init_velocity_ckpt。
+
+如需重新训练 baseline：
+
+~~~bash
+python run.py --task configs/task/train_vm_cached.yaml
+~~~
+
+### 第二阶段：正式训练 Coupled VelocityModule
+
+~~~bash
+python run.py --task configs/task/train_cvm_cached.yaml
+~~~
+
+checkpoint 保存在：
+
+~~~text
+experiments/cvm/checkpoint_<epoch>.pkl
+~~~
+
+使用本地 validation loss 筛选 CVM：
+
+~~~bash
+python select_best_checkpoint.py \
+  --ckpt_dir experiments/cvm \
+  --task_template configs/task/train_cvm_cached.yaml \
+  --output_dir checkpoint_selection_cvm \
+  --copy_best
+~~~
+
+筛选结果为：
+
+~~~text
+checkpoint_selection_cvm/best_checkpoint.pkl
+~~~
+
+### 第三阶段：正式训练 DistanceModule
+
+训练前修改 configs/model/straightpcf.yaml：
+
+~~~yaml
+init_cvm_ckpt: checkpoint_selection_cvm/best_checkpoint.pkl
+~~~
+
+然后运行：
+
+~~~bash
+python run.py --task configs/task/train_straightpcf_cached.yaml
+~~~
+
+此阶段会冻结 CVM 参数，只训练 DistanceModule。checkpoint 保存在：
+
+~~~text
+experiments/straightpcf/checkpoint_<epoch>.pkl
+~~~
+
+筛选完整 StraightPCF checkpoint：
+
+~~~bash
+python select_best_checkpoint.py \
+  --ckpt_dir experiments/straightpcf \
+  --task_template configs/task/train_straightpcf_cached.yaml \
+  --output_dir checkpoint_selection_straightpcf \
+  --copy_best
+~~~
+
+### StraightPCF 预测
+
+预测前需要确认两个路径。
+
+configs/model/straightpcf.yaml：
+
+~~~yaml
+init_cvm_ckpt: checkpoint_selection_cvm/best_checkpoint.pkl
+~~~
+
+configs/task/predict_straightpcf.yaml：
+
+~~~yaml
+load_ckpt: checkpoint_selection_straightpcf/best_checkpoint.pkl
+~~~
+
+运行：
+
+~~~bash
+python run.py --task configs/task/predict_straightpcf.yaml
+~~~
+
+预测仍使用 configs/transform/predict.yaml 的空 predict_transform，不会给测试集 noisy.npy 二次加噪。输出目录和 baseline 相同：
+
+~~~text
+results/dataset_test_noisy/shapenet/<synset_id>/<model_id>/denoised.npy
+~~~
+
+输出验证和打包命令与前文 baseline 完全相同。

@@ -162,8 +162,23 @@ class AugmentPatch(Augment):
         tree = cKDTree(pc_noisy)
         _, nn_idx = tree.query(seed_points, k=self.patch_size)   # (P, M)
 
-        pat_A = pc_noisy[nn_idx]  # (P, M, 3)
-        pat_B = pc[nn_idx]        # (P, M, 3)
+        pat_A = pc_noisy[nn_idx].astype(np.float32, copy=False)  # (P, M, 3)
+        pat_B = pc[nn_idx].astype(np.float32, copy=False)        # (P, M, 3)
+
+        if self.train_cvm_network:
+            # CVM and DistanceModule share one interpolation time per patch.
+            t = np.random.uniform(1e-8, 1.0, size=(self.num_patches,)).astype(np.float32)
+            seed_points_t = (
+                t[:, None] * pc[seed_idx] +
+                (1.0 - t[:, None]) * pc_noisy[seed_idx]
+            ).astype(np.float32, copy=False)
+            if asset.meta is None:
+                asset.meta = {}
+            asset.meta['pc_noisy'] = pat_A
+            asset.meta['pc_clean'] = pat_B
+            asset.meta['seed_points_t'] = seed_points_t[:, None, :]
+            asset.meta['original_time_step'] = t
+            return
 
         l1, l2 = 1e-8, 1.0
         t = np.random.rand(self.num_patches, self.patch_size, 1)
