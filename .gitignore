@@ -23,3 +23,6 @@ venv/
 .vscode/
 .DS_Store
 
+# Local Cursor skills (not shared)
+.cursor/skills/
+

@@ -1,22 +1,212 @@
-# 基于 Jittor 的点云降噪 Baseline
+# 点云降噪（Point Cloud Denoising）Baseline
 
-本项目用于点云降噪任务：输入含噪点云 `noisy.npy`，模型预测每个点的三维位移，并输出相同点数的 `denoised.npy`。项目保留官方 OBJ 训练流程，同时提供 clean point cloud 缓存训练流程，用于减少每个 epoch 重复解析 OBJ 和 mesh 表面采样造成的 CPU/IO 开销。
+基于 [Jittor](https://cg.cs.tsinghua.edu.cn/jittor/) 的点云降噪 Baseline。给定含噪点云，预测逐点位移，将点“推回”真实表面附近，输出与输入点数相同的降噪点云。
 
-## 拉普拉斯噪声适配说明
+方法参考：[StraightPCF](https://openaccess.thecvf.com/content/CVPR2024/html/Edirimuni_StraightPCF_Straight_Point_Cloud_Filtering_CVPR_2024_paper.html)（CVPR 2024）。本仓库在官方 starter 基础上保留 OBJ 训练流程，并提供 clean 点云缓存训练、拉普拉斯噪声适配，以及完整 StraightPCF 三阶段训练。
 
-本项目针对拉普拉斯噪声做了三处适配：
+---
 
-1. **噪声建模**(`src/data/augment.py` 的 `AugmentAddNoise`)：通过 `noise_type` 支持 `laplace`（默认）与 `gaussian`。配置中的 `noise_std_min/max` 统一表示噪声**标准差**；拉普拉斯采样时自动将标准差换算为尺度参数 `b = std / sqrt(2)`，保证训练噪声强度与测试集一致。
-2. **损失函数**(`src/model/vm.py`、`src/model/straightpcf.py`)：拉普拉斯噪声的最大似然估计对应 L1 损失，因此三个阶段（VM / CVM / DistanceModule）统一使用 Charbonnier（平滑 L1）损失 `sqrt(||d||^2 + eps)`，既对拉普拉斯重尾离群噪声鲁棒，又避免 L1 在零点不可导。
-3. **推理融合**(`src/model/vm.py` 的 `patch_based_denoise`)：每个点的最终位置由覆盖它的所有 patch 预测按 `exp(-dist)` 加权融合得到，替代原先"只取单个最佳 patch"的策略，可抑制离群 patch 预测；同时用 scatter 向量化实现，替代逐点 Python 循环，推理显著加速。
+## 1. 赛题简介
 
-## 竞赛提分工具
+三维传感（LiDAR、结构光、深度相机等）获取的点云常受传感器误差、环境干扰与量化误差影响，点偏离真实表面，损害重建、法向估计、识别等下游任务。
 
-### 按 CD 选 checkpoint
+**任务**：输入含噪点 \(\{p_i + n_i\}_{i=1}^{N}\)，预测位移 \(\Delta_i\)，使降噪点 \(\hat{p}_i = p_i + n_i + \Delta_i\) 尽可能贴近真实表面。可建模为逐点位移回归，或分数匹配 / 扩散式去噪。
 
-`select_best_checkpoint.py` 新增 `--metric cd`：在验证集上动态加噪、实际推理并计算 Chamfer Distance，与竞赛评分直接对齐（噪声种子固定，所有 checkpoint 输入一致）：
+**主要挑战**：噪声分布多样、尖锐细节保持、大规模点云可扩展性、跨类别泛化。
+
+---
+
+## 2. 数据说明
+
+| 资源 | 文件 |
+|------|------|
+| A 榜训练集（干净网格） | `dataset_train.tar.gz` |
+| A 榜测试集（含噪点云） | `dataset_test_noisy.zip` |
+| Baseline / Starter Code | `starter_code.zip` |
+
+- **A 榜**：中等规模 ShapeNet 子集（飞机、椅子、桌子、汽车等），每样本约 50,000 点，噪声标准差 0.005～0.020（单位球归一化后）。
+- **B 榜**：更大规模、更多类别与更高噪声，需兼顾效率；AB 榜算法应基本一致。
+- **禁止**使用提供数据集以外的数据，否则取消资格。
+
+### 目录结构
+
+**训练集**（约 2 万模型，`.obj` 干净网格；自行采样加点噪，Baseline 已含流程）：
+
+```text
+dataset_train/
+  shapenet/<synset_id>/<model_id>/models/model_normalized.obj
+```
+
+**测试集**（仅含噪 `.npy`，`float32`，shape `(N, 3)`；GT 由组委会持有）：
+
+```text
+dataset_test_noisy/
+  shapenet/<synset_id>/<model_id>/noisy.npy
+```
+
+`datalist/train.txt`、`datalist/validate.txt`、`datalist/test.txt` 中为相对数据集根目录的模型路径，例如：
+
+```text
+shapenet/04401088/d7ed512f7a7daf63772afc88105fa679
+```
+
+### 数据准备
 
 ```bash
+tar xzf dataset_train.tar.gz
+unzip dataset_test_noisy.zip
+```
+
+---
+
+## 3. Baseline 架构
+
+| 模块 | 说明 |
+|------|------|
+| 特征提取 | 动态图卷积（Dynamic Edge Convolution）+ KNN 局部图 |
+| 位移解码 | MLP → 三维位移向量 |
+| 训练目标 | 监督学习：含噪点相对干净点的位移回归 |
+| 推理 | Patch 分块降噪 + 加权融合，适配大规模点云 |
+
+### 本仓库相对官方 starter 的适配
+
+1. **噪声建模**（`src/data/augment.py`）：`noise_type` 支持 `laplace`（默认）与 `gaussian`。配置中 `noise_std_min/max` 表示噪声标准差；拉普拉斯采样时换算为尺度 \(b = \mathrm{std}/\sqrt{2}\)。
+2. **损失函数**（`src/model/vm.py`、`src/model/straightpcf.py`）：三阶段统一使用 Charbonnier（平滑 L1）损失 \(\sqrt{\|d\|^2 + \varepsilon}\)，对重尾噪声更鲁棒。
+3. **推理融合**（`src/model/vm.py`）：多 patch 按 \(\exp(-\mathrm{dist})\) 加权融合，并用 scatter 向量化加速。
+
+---
+
+## 4. 环境安装
+
+推荐 Python 3.9，GCC/G++ ≤ 10。本赛题**必须**使用 Jittor。
+
+```bash
+conda create -n jittor python=3.9 -y
+conda activate jittor
+conda install -c conda-forge gcc=10 gxx=10 libgomp -y
+python -m pip install -r requirements.txt
+```
+
+`requirements.txt` 含：`jittor`、`numpy`、`trimesh`、`scipy`、`omegaconf`。
+
+本地评测需精确 P2S 时额外安装：
+
+```bash
+pip install point-cloud-utils
+```
+
+文档：[Jittor Docs](https://cg.cs.tsinghua.edu.cn/jittor/assets/docs/)。环境要求：Ubuntu ≥ 16.04 或 WSL；Python ≥ 3.7；g++ ≥ 5.4。Windows 需通过 WSL（当前 WSL 尚不支持 CUDA）。
+
+也可通过 Docker / pip / 源码安装 Jittor，或设置 `cc_path` / `nvcc_path` 指定编译器。启用 CUDA 示例：
+
+```bash
+export nvcc_path="/usr/local/cuda/bin/nvcc"
+python3 -m jittor.test.test_cuda
+```
+
+### 多 worker 训练时限制 CPU 线程
+
+DataLoader `num_workers` 较大时，NumPy/BLAS 可能造成 CPU 过度订阅。训练前在当前终端执行：
+
+```bash
+source scripts/run_single_thread.sh
+```
+
+会设置 `OMP_NUM_THREADS` 等为 1（仅当前终端有效，需用 `source`）。
+
+---
+
+## 5. 训练
+
+### 5.1 原始 OBJ 训练
+
+每次读取 OBJ，动态做表面采样、归一化、加噪与 patch 构造：
+
+```bash
+python run.py --task configs/task/train_vm.yaml
+```
+
+权重默认：`experiments/vm/checkpoint_<epoch>.pkl`。
+
+### 5.2 Clean 点云缓存（推荐）
+
+预采样可减少每 epoch 解析 OBJ / mesh 采样的 CPU/IO 开销。`scripts/precompute_clean_points.py` 输出：
+
+```text
+dataset_train_pcd/
+  shapenet/<synset_id>/<model_id>/
+    clean.npy      # 默认 200000 个按面积采样的表面点
+    vertices.npy   # OBJ 全部原始顶点
+```
+
+训练时随机取最多 1024 个原始顶点，再从表面点池补齐到 32768 点；随后仍动态加噪并构造 patch，不会固定 noisy 数据。
+
+```bash
+# 小规模测试
+python scripts/precompute_clean_points.py \
+  --input_dir dataset_train --output_dir dataset_train_pcd \
+  --num_points 200000 --workers 8 --seed 123 --limit 100
+
+# 完整缓存（约 15833 个模型，200000 点 float32 约 38 GB）
+python scripts/precompute_clean_points.py \
+  --input_dir dataset_train --output_dir dataset_train_pcd \
+  --num_points 200000 --workers 16 --seed 123
+```
+
+已有文件默认跳过，可断点续跑；升级旧版点数或强制重生成需加 `--overwrite`。`/dev/shm` 空间充足时可写到内存盘再软链到 `dataset_train_pcd`。
+
+数量检查：
+
+```bash
+find dataset_train -path '*/models/model_normalized.obj' -type f | wc -l
+find dataset_train_pcd -name clean.npy -type f | wc -l
+find dataset_train_pcd -name vertices.npy -type f | wc -l
+```
+
+缓存训练（每 epoch 10000 个训练样本）：
+
+```bash
+python run.py --task configs/task/train_vm_cached.yaml
+```
+
+数据流：`vertices.npy` + `clean.npy` → 抽样至 32768 点 → 归一化 → 动态 Laplace 噪声 → 1000 点局部 patch → 训练位移 / velocity target。
+
+### 5.3 StraightPCF 三阶段（顺序不可交换）
+
+1. 训练 VelocityModule（VM）
+2. 用同一 VM 最优权重复制初始化多个模块，联合训练 Coupled VelocityModule（CVM）
+3. 加载并冻结 CVM，训练 DistanceModule
+
+```bash
+# 阶段 1：VM（若尚未训练）
+python run.py --task configs/task/train_vm_cached.yaml
+
+# 阶段 2：确认 configs/model/cvm.yaml 中
+#   init_velocity_ckpt: checkpoint_selection_cached/best_checkpoint.pkl
+python run.py --task configs/task/train_cvm_cached.yaml
+
+# 阶段 3：确认 configs/model/straightpcf.yaml 中
+#   init_cvm_ckpt: checkpoint_selection_cvm/best_checkpoint.pkl
+python run.py --task configs/task/train_straightpcf_cached.yaml
+```
+
+对应 checkpoint 目录：`experiments/vm`、`experiments/cvm`、`experiments/straightpcf`。
+
+---
+
+## 6. 选择最佳 Checkpoint
+
+`select_best_checkpoint.py` 在本地验证集上评估，不需要官方测试 GT。可用 validation loss，或 `--metric cd`（动态加噪后算 Chamfer Distance，与竞赛更对齐）。
+
+```bash
+# 按 validation loss（缓存 VM 示例）
+python select_best_checkpoint.py \
+  --ckpt_dir experiments/vm \
+  --task_template configs/task/train_vm_cached.yaml \
+  --output_dir checkpoint_selection_cached \
+  --copy_best
+
+# 按 CD（噪声种子固定，默认 std 0.005~0.020）
 python select_best_checkpoint.py \
   --ckpt_dir experiments/vm \
   --task_template configs/task/train_vm_cached.yaml \
@@ -25,343 +215,55 @@ python select_best_checkpoint.py \
   --copy_best
 ```
 
-`--noise_std_min/max` 控制 CD 评估的加噪范围，默认与训练一致（0.005~0.020）。
+CVM / StraightPCF 同理，改 `--ckpt_dir`、`--task_template`、`--output_dir` 即可。常用参数：`--pattern`、`--start_epoch` / `--end_epoch`、`--limit`、`--resume`、`--use_cuda 0`。
 
-### 估计测试集噪声水平
-
-```bash
-python scripts/estimate_noise_level.py --input_dir dataset_test_noisy
-```
-
-通过局部 PCA 法向残差估计单轴噪声 std（中位数稳健、略偏大）。若测试噪声集中在某个固定值，建议把配置的 `noise_std_min/max` 收窄对准它。
-
-### 推理多轮迭代
-
-模型配置（如 `configs/model/vm.yaml`）新增可选项：
-
-```yaml
-predict_rounds: 2        # 多轮迭代降噪，默认 1；>1 需在验证集确认不过度收缩
-```
-
-## 环境安装
-
-推荐使用 Python 3.9，并确保 GCC/G++ 版本不高于 10。
-
-```bash
-conda create -n jittor2A python=3.9 -y
-conda activate jittor2A
-conda install -c conda-forge gcc=10 gxx=10 libgomp -y
-python -m pip install -r requirements.txt
-```
-
-`requirements.txt` 包含：
-
-- `jittor`
-- `numpy`
-- `trimesh`
-- `scipy`
-- `omegaconf`
-
-如需运行 `evaluate.py` 的精确 P2S 计算，可额外安装：
-
-```bash
-pip install point-cloud-utils
-```
-
-### 多 worker 训练时限制 CPU 线程
-
-当 DataLoader 使用较多 `num_workers` 时，NumPy/BLAS 可能让每个 worker 再创建多个计算线程，造成 CPU 过度订阅。先在当前终端中加载脚本：
-
-```bash
-source scripts/run_single_thread.sh
-```
-
-然后继续使用原来的训练命令，例如：
-
-```bash
-python run.py --task configs/task/train_cvm_cached.yaml
-```
-
-脚本只为当前终端设置以下变量，不会自动启动训练，也不会修改配置文件：
+输出示例：
 
 ```text
-OMP_NUM_THREADS=1
-MKL_NUM_THREADS=1
-OPENBLAS_NUM_THREADS=1
-NUMEXPR_NUM_THREADS=1
-```
-
-必须使用 `source`（或 `. scripts/run_single_thread.sh`），直接执行脚本无法修改当前终端的环境变量。关闭终端后设置会自动失效。
-
-## 数据准备
-
-将官方训练集和测试集放在项目根目录：
-
-```text
-dataset_train/
-└── shapenet/<synset_id>/<model_id>/models/model_normalized.obj
-
-dataset_test_noisy/
-└── shapenet/<synset_id>/<model_id>/noisy.npy
-```
-
-例如：
-
-```bash
-tar xzf dataset_train.tar.gz
-unzip dataset_test_noisy.zip
-```
-
-`datalist/train.txt`、`datalist/validate.txt` 和 `datalist/test.txt` 中保存相对于数据集根目录的模型路径，例如：
-
-```text
-shapenet/04401088/d7ed512f7a7daf63772afc88105fa679
-```
-
-## 原始 OBJ 训练
-
-原始 baseline 每次读取 OBJ，并动态执行 mesh 表面采样、归一化、加噪和 patch 构造：
-
-```bash
-python run.py --task configs/task/train_vm.yaml
-```
-
-权重默认保存在：
-
-```text
-experiments/vm/checkpoint_<epoch>.pkl
-```
-
-## Clean Point Cloud 缓存
-
-### `precompute_clean_points.py` 的作用
-
-`scripts/precompute_clean_points.py` 将官方训练集中的 OBJ mesh 预采样成 clean point cloud：
-
-```text
-dataset_train_pcd/
-└── shapenet/<synset_id>/<model_id>/
-    ├── clean.npy
-    └── vertices.npy
-```
-
-默认每个 mesh 保存两类数据：`clean.npy` 是 200000 个按面积采样的表面点，`vertices.npy` 是 OBJ 中的全部原始顶点；两者均为 `np.float32`、shape 为 `(N, 3)`。
-
-训练时随机选择最多 1024 个原始顶点，再从 200000 个表面点中无放回抽样，补齐到 32768 点。随后仍会重新添加随机噪声并重新构造 patch，因此不会固定 noisy 数据。
-
-### 小规模测试
-
-先测试一个模型：
-
-```bash
-python scripts/precompute_clean_points.py \
-  --input_dir dataset_train \
-  --output_dir dataset_train_pcd \
-  --num_points 200000 \
-  --workers 1 \
-  --seed 123 \
-  --limit 1
-```
-
-再测试前 100 个模型和多进程：
-
-```bash
-python scripts/precompute_clean_points.py \
-  --input_dir dataset_train \
-  --output_dir dataset_train_pcd \
-  --num_points 200000 \
-  --workers 8 \
-  --seed 123 \
-  --limit 100
-```
-
-### 生成完整缓存
-
-```bash
-python scripts/precompute_clean_points.py \
-  --input_dir dataset_train \
-  --output_dir dataset_train_pcd \
-  --num_points 200000 \
-  --workers 16 \
-  --seed 123
-```
-
-已有 `clean.npy` 和 `vertices.npy` 时默认会被跳过，因此中断后可直接重新运行同一命令。若目录中只有旧版 `clean.npy`，脚本只补建 `vertices.npy` 并保留旧表面点；要把旧版 50000 点缓存升级为 200000 点，必须使用 `--overwrite`，或改用新的输出目录。完整 15833 个模型的 200000 点 `float32` 表面缓存约需 38 GB，另需少量空间保存原始顶点。
-
-需要重新生成已有缓存时使用 `--overwrite`：
-
-```bash
-python scripts/precompute_clean_points.py \
-  --input_dir dataset_train \
-  --output_dir dataset_train_pcd \
-  --num_points 200000 \
-  --workers 16 \
-  --seed 123 \
-  --overwrite
-```
-
-参数说明：
-
-- `--input_dir`：官方 OBJ 训练集根目录。
-- `--output_dir`：clean 点云缓存目录。
-- `--num_points`：每个 mesh 保存的点数，默认 200000。
-- `--workers`：CPU worker 数，建议先测试 8，再尝试 16。
-- `--seed`：全局随机种子；每个模型使用稳定的独立种子。
-- `--limit`：只处理前 N 个模型，适合功能测试。
-- `--overwrite`：覆盖已存在的 `clean.npy` 和 `vertices.npy`。
-
-检查 OBJ 和缓存数量：
-
-```bash
-find dataset_train -path '*/models/model_normalized.obj' -type f | wc -l
-find dataset_train_pcd -name clean.npy -type f | wc -l
-find dataset_train_pcd -name vertices.npy -type f | wc -l
-```
-
-完整数据中三项数量应当一致。当前官方训练集预期为 15833 个模型。
-
-### 使用内存盘
-
-如果 `/dev/shm` 空间充足，可以直接把缓存生成到内存盘：
-
-```bash
-python scripts/precompute_clean_points.py \
-  --input_dir dataset_train \
-  --output_dir /dev/shm/dataset_train_pcd \
-  --num_points 200000 \
-  --workers 16 \
-  --seed 123
-
-ln -s /dev/shm/dataset_train_pcd dataset_train_pcd
-```
-
-创建软链接前，应确保项目根目录中不存在同名的 `dataset_train_pcd` 文件或目录。服务器关机或重启后，`/dev/shm` 内容通常会消失。
-
-## 使用缓存训练
-
-正式缓存训练每个 epoch 使用 10000 个训练样本：
-
-```bash
-python run.py --task configs/task/train_vm_cached.yaml
-```
-
-缓存模式的数据流程为：
-
-```text
-vertices.npy（全部原始顶点） + clean.npy（200000 个表面点）
-  -> 随机取最多 1024 个原始顶点
-  -> 从表面点池补齐到 32768 点
-  -> 归一化
-  -> 动态添加 Laplace 噪声
-  -> 构造 1000 点局部 patch
-  -> 训练 displacement/velocity target
-```
-
-原始 OBJ 配置没有被覆盖，仍可随时使用：
-
-```bash
-python run.py --task configs/task/train_vm.yaml
-```
-
-## 选择最佳 Checkpoint
-
-### `select_best_checkpoint.py` 的作用
-
-训练会生成多个 `checkpoint_<epoch>.pkl`。`select_best_checkpoint.py` 使用本地 `validate_dataset` 逐个计算 validation loss，并按 loss 从低到高排序，不需要比赛官方测试 GT。
-
-需要注意：validation loss 是模型训练目标的代理指标，不等同于官方 CD/P2S 排名，但通常比直接固定使用最后一个 epoch 更可靠。
-
-### 快速测试
-
-仅评估前 3 个 checkpoint：
-
-```bash
-python select_best_checkpoint.py \
-  --ckpt_dir experiments/vm \
-  --limit 3
-```
-
-### 评估全部 checkpoint 并复制最佳权重
-
-原始 OBJ 训练对应：
-
-```bash
-python select_best_checkpoint.py \
-  --ckpt_dir experiments/vm \
-  --task_template configs/task/train_vm.yaml \
-  --output_dir checkpoint_selection \
-  --copy_best
-```
-
-缓存训练对应：
-
-```bash
-python select_best_checkpoint.py \
-  --ckpt_dir experiments/vm \
-  --task_template configs/task/train_vm_cached.yaml \
-  --output_dir checkpoint_selection_cached \
-  --copy_best
-```
-
-输出包括：
-
-```text
-checkpoint_selection/
+checkpoint_selection_cached/
 ├── checkpoint_ranking.csv
 ├── checkpoint_ranking.json
 ├── best_checkpoint.pkl
 └── logs/
 ```
 
-常用参数：
-
-- `--pattern`：checkpoint 文件匹配规则，默认 `checkpoint_*.pkl`。
-- `--start_epoch` / `--end_epoch`：限制评估 epoch 范围。
-- `--limit`：最多评估多少个 checkpoint。
-- `--resume`：跳过排名 JSON 中已经成功评估的 checkpoint。
-- `--copy_best`：复制最佳权重为 `best_checkpoint.pkl`。
-- `--data_config`：显式指定用于验证的数据配置。
-- `--use_cuda 0`：使用 CPU 验证；默认使用 CUDA。
-
-例如只评估 epoch 80 至 99，并支持断点继续：
+辅助工具：估计测试集噪声水平
 
 ```bash
-python select_best_checkpoint.py \
-  --ckpt_dir experiments/vm \
-  --start_epoch 80 \
-  --end_epoch 99 \
-  --resume \
-  --copy_best
+python scripts/estimate_noise_level.py --input_dir dataset_test_noisy
 ```
 
-## 推理
+若测试噪声集中在某固定值，可将配置中 `noise_std_min/max` 收窄对准。模型配置可设 `predict_rounds`（多轮迭代降噪，默认 1；>1 需在验证集确认不过度收缩）。
 
-修改 `configs/task/predict_vm.yaml` 中的权重路径：
+---
+
+## 7. 推理与提交
+
+### 推理
+
+在对应 predict 配置中设置权重路径，例如 `configs/task/predict_vm.yaml`：
 
 ```yaml
-load_ckpt: checkpoint_selection/best_checkpoint.pkl
+load_ckpt: checkpoint_selection_cached/best_checkpoint.pkl
 ```
 
-然后运行：
+StraightPCF 还需确认 `configs/model/straightpcf.yaml` 的 `init_cvm_ckpt`，以及 `configs/task/predict_straightpcf.yaml` 的 `load_ckpt`。
 
 ```bash
 python run.py --task configs/task/predict_vm.yaml
+# 或
+python run.py --task configs/task/predict_straightpcf.yaml
 ```
 
-预测配置使用独立的空 `predict_transform`，不会对已经含噪的 `noisy.npy` 再次添加噪声。结果保存到：
+预测使用空 `predict_transform`，不会对已含噪的 `noisy.npy` 再次加噪。结果：
 
 ```text
 results/dataset_test_noisy/shapenet/<synset_id>/<model_id>/denoised.npy
 ```
 
-每个输出应满足：
+要求：`shape` 与输入一致，`dtype` 为 `np.float32`。
 
-```text
-shape 与输入 noisy.npy 完全相同
-dtype 为 np.float32
-```
-
-## 验证预测输出
+### 验证输出
 
 ```bash
 python - <<'PY'
@@ -378,7 +280,6 @@ for noisy_path in noisy_root.glob('shapenet/*/*/noisy.npy'):
     if not output_path.exists():
         errors.append(f'缺少输出: {output_path}')
         continue
-
     noisy = np.load(noisy_path, mmap_mode='r')
     denoised = np.load(output_path, mmap_mode='r')
     if denoised.shape != noisy.shape:
@@ -395,141 +296,90 @@ print('验证通过：所有 denoised.npy 的 shape、dtype 和数值均正常')
 PY
 ```
 
-## 打包提交
+### 打包提交
 
 ```bash
 cd results/dataset_test_noisy
 zip -r ../../result.zip shapenet/
 ```
 
-最终压缩包结构必须是：
-
 ```text
 result.zip
 └── shapenet/
     └── <synset_id>/
         └── <model_id>/
-            └── denoised.npy
+            └── denoised.npy   # float32, shape (N, 3)
 ```
 
+```python
+import numpy as np
+np.save("denoised.npy", denoised_points.astype(np.float32))
+```
 
-## Jittor StraightPCF（CVM + DistanceModule）
+每队每天最多提交 **2** 次。成绩有效须按赛事开源指南开源代码。
 
-本分支补齐了 StraightPCF 的后两个训练阶段。完整训练顺序不可交换：
+---
 
-1. 训练单个 VelocityModule（已有 baseline）。
-2. 将同一个第一阶段 VM 最优权重复制初始化多个 VelocityModule，联合训练 Coupled VelocityModule（CVM）。
-3. 加载训练完成的 CVM，冻结其参数，训练 DistanceModule 和最终位置损失。
+## 8. 评测指标
 
-实现仍使用 Jittor，输入和输出点数完全相同。正式训练使用缓存 clean point cloud，但噪声、patch 和时间步仍在每次取样时动态生成。
+计算前将真实点云归一化至单位球（中心化 + 最大半径为 1），预测点施加相同变换。
 
-### 第一阶段：准备 VelocityModule 最优权重
+### Chamfer Distance (CD)
 
-默认 CVM 配置从最新的缓存版 Charbonnier VM 最优权重初始化四个 VelocityModule：
+预测点云与真实干净点云之间的双向平均最近邻距离之和，越小越好。
 
-~~~text
-checkpoint_selection_cached/best_checkpoint.pkl
-~~~
+\[
+\mathrm{CD}(S_{\mathrm{pred}}, S_{\mathrm{gt}})
+= \frac{1}{|S_{\mathrm{pred}}|}\sum_{x\in S_{\mathrm{pred}}}\min_{y\in S_{\mathrm{gt}}}\|x-y\|_2
++ \frac{1}{|S_{\mathrm{gt}}|}\sum_{y\in S_{\mathrm{gt}}}\min_{x\in S_{\mathrm{pred}}}\|y-x\|_2
+\]
 
-对应配置位于 configs/model/cvm.yaml：
+### Point-to-Surface (P2S)
 
-~~~yaml
-init_velocity_ckpt: checkpoint_selection_cached/best_checkpoint.pkl
-num_modules: 4
-~~~
+预测点到原始干净网格表面的最近距离平方均值，越小越好；对过度平滑或表面偏移更敏感。
 
-如果 VM 最优权重位于其他目录，请先修改 init_velocity_ckpt。
+\[
+\mathrm{P2S}(S_{\mathrm{pred}}, M)
+= \frac{1}{|S_{\mathrm{pred}}|}\sum_{x\in S_{\mathrm{pred}}}\min_{y\in M}\|x-y\|_2^2
+\]
 
-如需重新训练 baseline：
+### 百分制得分
 
-~~~bash
-python run.py --task configs/task/train_vm_cached.yaml
-~~~
+以含噪输入为零分基线：
 
-### 第二阶段：正式训练 Coupled VelocityModule
+\[
+\mathrm{cd\_score}_i = \mathrm{clamp}\!\left(100\times\left(1-\frac{\mathrm{CD}_{\mathrm{pred}}^{(i)}}{\mathrm{CD}_{\mathrm{noisy}}^{(i)}}\right),\,0,\,100\right)
+\]
 
-~~~bash
-python run.py --task configs/task/train_cvm_cached.yaml
-~~~
+\[
+\mathrm{p2s\_score}_i = \mathrm{clamp}\!\left(100\times\left(1-\frac{\mathrm{P2S}_{\mathrm{pred}}^{(i)}}{\mathrm{P2S}_{\mathrm{noisy}}^{(i)}}\right),\,0,\,100\right)
+\]
 
-checkpoint 保存在：
+**A 榜最终分**：全部测试样本上 CD 得分与 P2S 得分各取全局平均，再按 **50% / 50%** 加权。
 
-~~~text
-experiments/cvm/checkpoint_<epoch>.pkl
-~~~
+**B 榜**：评测方式将据 A 榜结果调整；最终得分 = **65% 评测 + 35% 答辩**。A 榜结束后按排名筛选进入 B 榜。
 
-使用本地 validation loss 筛选 CVM：
+### 本地评测（GT 通常仅组委会持有）
 
-~~~bash
-python select_best_checkpoint.py \
-  --ckpt_dir experiments/cvm \
-  --task_template configs/task/train_cvm_cached.yaml \
-  --output_dir checkpoint_selection_cvm \
-  --copy_best
-~~~
+```bash
+python evaluate.py \
+    --pred_dir ./results/dataset_test_noisy \
+    --gt_dir ./test_gt \
+    --noisy_dir ./dataset_test_noisy \
+    --mesh_dir ./dataset_train \
+    --workers 8 \
+    --verbose
+```
 
-筛选结果为：
+`--mesh_dir` 用于 P2S（需 `point-cloud-utils`）；省略则仅算 CD。
 
-~~~text
-checkpoint_selection_cvm/best_checkpoint.pkl
-~~~
+---
 
-### 第三阶段：正式训练 DistanceModule
+## 9. 注意事项
 
-训练前修改 configs/model/straightpcf.yaml：
-
-~~~yaml
-init_cvm_ckpt: checkpoint_selection_cvm/best_checkpoint.pkl
-~~~
-
-然后运行：
-
-~~~bash
-python run.py --task configs/task/train_straightpcf_cached.yaml
-~~~
-
-此阶段会冻结 CVM 参数，只训练 DistanceModule。checkpoint 保存在：
-
-~~~text
-experiments/straightpcf/checkpoint_<epoch>.pkl
-~~~
-
-筛选完整 StraightPCF checkpoint：
-
-~~~bash
-python select_best_checkpoint.py \
-  --ckpt_dir experiments/straightpcf \
-  --task_template configs/task/train_straightpcf_cached.yaml \
-  --output_dir checkpoint_selection_straightpcf \
-  --copy_best
-~~~
-
-### StraightPCF 预测
-
-预测前需要确认两个路径。
-
-configs/model/straightpcf.yaml：
-
-~~~yaml
-init_cvm_ckpt: checkpoint_selection_cvm/best_checkpoint.pkl
-~~~
-
-configs/task/predict_straightpcf.yaml：
-
-~~~yaml
-load_ckpt: checkpoint_selection_straightpcf/best_checkpoint.pkl
-~~~
-
-运行：
-
-~~~bash
-python run.py --task configs/task/predict_straightpcf.yaml
-~~~
-
-预测仍使用 configs/transform/predict.yaml 的空 predict_transform，不会给测试集 noisy.npy 二次加噪。输出目录和 baseline 相同：
-
-~~~text
-results/dataset_test_noisy/shapenet/<synset_id>/<model_id>/denoised.npy
-~~~
-
-输出验证和打包命令与前文 baseline 完全相同。
+1. 需通过热身赛后方可参赛。
+2. **必须**使用 Jittor；不得使用额外外部数据。
+3. 不同类别可用不同网络 / 权重 / 超参。
+4. 输出点数必须与输入含噪点云一致，否则评测报错。
+5. 须按开源指南开源代码，成绩方有效。
+6. 每队每天最多提交两次。
