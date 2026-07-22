@@ -46,16 +46,29 @@ class AugmentSample(Augment):
             return
 
         # Cached clean point clouds have already been sampled from the mesh.
-        # Draw a fresh subset on every __getitem__ call so epochs still see
-        # different clean inputs before dynamic noise and patch construction.
+        # Preserve original OBJ vertices, then fill from the surface pool.
         pc = asset.sampled_vertices
         if pc is None:
             raise ValueError("sample requires either a mesh or a cached clean point cloud")
         if pc.ndim != 2 or pc.shape[1] != 3:
             raise ValueError(f"cached clean point cloud must have shape (N, 3), got {pc.shape}")
-        replace = pc.shape[0] < self.num_samples
-        indices = np.random.choice(pc.shape[0], size=self.num_samples, replace=replace)
-        asset.sampled_vertices = pc[indices].astype(np.float32, copy=False)
+
+        cached_vertices = asset.cached_vertices
+        if cached_vertices is not None:
+            num_vertices = min(
+                self.num_vertex_samples, self.num_samples, cached_vertices.shape[0]
+            )
+            vertex_indices = np.random.permutation(cached_vertices.shape[0])[:num_vertices]
+            selected_vertices = cached_vertices[vertex_indices]
+        else:
+            num_vertices = 0
+            selected_vertices = np.empty((0, 3), dtype=np.float32)
+
+        num_surface = self.num_samples - num_vertices
+        replace = pc.shape[0] < num_surface
+        surface_indices = np.random.choice(pc.shape[0], size=num_surface, replace=replace)
+        sampled = np.concatenate([selected_vertices, pc[surface_indices]], axis=0)
+        asset.sampled_vertices = sampled.astype(np.float32, copy=False)
 
 @dataclass(frozen=True)
 class AugmentNormalizePC(Augment):

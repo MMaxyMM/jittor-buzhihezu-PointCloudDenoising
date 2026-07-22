@@ -17,6 +17,11 @@ class Asset():
     faces: Optional[ndarray]=None # shape (F, 3)
     
     sampled_vertices: Optional[ndarray]=None
+
+    # Original OBJ vertices stored alongside a cached surface-point pool.
+    # AugmentSample may preserve a random subset of these during training.
+    cached_vertices: Optional[ndarray]=None
+
     
     sampled_vertices_noisy: Optional[ndarray]=None
     

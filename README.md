@@ -74,17 +74,14 @@ experiments/vm/checkpoint_<epoch>.pkl
 
 ```text
 dataset_train_pcd/
-└── shapenet/<synset_id>/<model_id>/clean.npy
+└── shapenet/<synset_id>/<model_id>/
+    ├── clean.npy
+    └── vertices.npy
 ```
 
-默认每个 mesh 采样 50000 个表面点，输出必须为：
+默认每个 mesh 保存两类数据：`clean.npy` 是 200000 个按面积采样的表面点，`vertices.npy` 是 OBJ 中的全部原始顶点；两者均为 `np.float32`、shape 为 `(N, 3)`。
 
-```text
-shape: (50000, 3)
-dtype: np.float32
-```
-
-缓存只固定 clean 表面点。训练时仍会动态抽取 32768 点、重新添加随机噪声并重新构造 patch，因此不会固定 noisy 数据。
+训练时随机选择最多 1024 个原始顶点，再从 200000 个表面点中无放回抽样，补齐到 32768 点。随后仍会重新添加随机噪声并重新构造 patch，因此不会固定 noisy 数据。
 
 ### 小规模测试
 
@@ -94,7 +91,7 @@ dtype: np.float32
 python scripts/precompute_clean_points.py \
   --input_dir dataset_train \
   --output_dir dataset_train_pcd \
-  --num_points 50000 \
+  --num_points 200000 \
   --workers 1 \
   --seed 123 \
   --limit 1
@@ -106,7 +103,7 @@ python scripts/precompute_clean_points.py \
 python scripts/precompute_clean_points.py \
   --input_dir dataset_train \
   --output_dir dataset_train_pcd \
-  --num_points 50000 \
+  --num_points 200000 \
   --workers 8 \
   --seed 123 \
   --limit 100
@@ -118,18 +115,20 @@ python scripts/precompute_clean_points.py \
 python scripts/precompute_clean_points.py \
   --input_dir dataset_train \
   --output_dir dataset_train_pcd \
-  --num_points 50000 \
+  --num_points 200000 \
   --workers 16 \
   --seed 123
 ```
 
-已有 `clean.npy` 默认会被跳过，因此中断后可直接重新运行同一命令。需要重新生成已有缓存时才使用 `--overwrite`：
+已有 `clean.npy` 和 `vertices.npy` 时默认会被跳过，因此中断后可直接重新运行同一命令。若目录中只有旧版 `clean.npy`，脚本只补建 `vertices.npy` 并保留旧表面点；要把旧版 50000 点缓存升级为 200000 点，必须使用 `--overwrite`，或改用新的输出目录。完整 15833 个模型的 200000 点 `float32` 表面缓存约需 38 GB，另需少量空间保存原始顶点。
+
+需要重新生成已有缓存时使用 `--overwrite`：
 
 ```bash
 python scripts/precompute_clean_points.py \
   --input_dir dataset_train \
   --output_dir dataset_train_pcd \
-  --num_points 50000 \
+  --num_points 200000 \
   --workers 16 \
   --seed 123 \
   --overwrite
@@ -139,20 +138,21 @@ python scripts/precompute_clean_points.py \
 
 - `--input_dir`：官方 OBJ 训练集根目录。
 - `--output_dir`：clean 点云缓存目录。
-- `--num_points`：每个 mesh 保存的点数，默认 50000。
+- `--num_points`：每个 mesh 保存的点数，默认 200000。
 - `--workers`：CPU worker 数，建议先测试 8，再尝试 16。
 - `--seed`：全局随机种子；每个模型使用稳定的独立种子。
 - `--limit`：只处理前 N 个模型，适合功能测试。
-- `--overwrite`：覆盖已存在的 `clean.npy`。
+- `--overwrite`：覆盖已存在的 `clean.npy` 和 `vertices.npy`。
 
 检查 OBJ 和缓存数量：
 
 ```bash
 find dataset_train -path '*/models/model_normalized.obj' -type f | wc -l
 find dataset_train_pcd -name clean.npy -type f | wc -l
+find dataset_train_pcd -name vertices.npy -type f | wc -l
 ```
 
-完整数据中两者应当一致。当前官方训练集预期为 15833 个模型。
+完整数据中三项数量应当一致。当前官方训练集预期为 15833 个模型。
 
 ### 使用内存盘
 
@@ -162,7 +162,7 @@ find dataset_train_pcd -name clean.npy -type f | wc -l
 python scripts/precompute_clean_points.py \
   --input_dir dataset_train \
   --output_dir /dev/shm/dataset_train_pcd \
-  --num_points 50000 \
+  --num_points 200000 \
   --workers 16 \
   --seed 123
 
@@ -188,8 +188,9 @@ python run.py --task configs/task/train_vm_cached.yaml
 缓存模式的数据流程为：
 
 ```text
-clean.npy (50000 点)
-  -> 动态随机抽取 32768 点
+vertices.npy（全部原始顶点） + clean.npy（200000 个表面点）
+  -> 随机取最多 1024 个原始顶点
+  -> 从表面点池补齐到 32768 点
   -> 归一化
   -> 动态添加 Laplace 噪声
   -> 构造 1000 点局部 patch
