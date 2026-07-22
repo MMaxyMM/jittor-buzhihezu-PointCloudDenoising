@@ -206,12 +206,6 @@ ln -s /dev/shm/dataset_train_pcd dataset_train_pcd
 
 ## 使用缓存训练
 
-快速调试配置每个 epoch 使用 1000 个训练样本，batch size 保持 16：
-
-```bash
-python run.py --task configs/task/train_vm_cached_debug.yaml
-```
-
 正式缓存训练每个 epoch 使用 10000 个训练样本：
 
 ```bash
@@ -395,29 +389,6 @@ result.zip
 3. 加载训练完成的 CVM，冻结其参数，训练 DistanceModule 和最终位置损失。
 
 实现仍使用 Jittor，输入和输出点数完全相同。正式训练使用缓存 clean point cloud，但噪声、patch 和时间步仍在每次取样时动态生成。
-
-### 先运行小规模端到端验证
-
-下面两个命令各训练 1 epoch，使用 train_cached_debug 的 1000 个文件：
-
-~~~bash
-python run.py --task configs/task/train_cvm_cached_debug.yaml
-python run.py --task configs/task/train_straightpcf_cached_debug.yaml
-~~~
-
-第一个命令输出：
-
-~~~text
-experiments/cvm_debug/checkpoint_0.pkl
-~~~
-
-第二个命令通过 configs/model/straightpcf_debug.yaml 加载上述 CVM checkpoint，输出：
-
-~~~text
-experiments/straightpcf_debug/checkpoint_0.pkl
-~~~
-
-这两个 checkpoint 只用于验证代码链路，不应作为正式提交权重。
 
 ### 第一阶段：准备 VelocityModule 最优权重
 

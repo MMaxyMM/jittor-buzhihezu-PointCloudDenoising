@@ -1,5 +1,4 @@
 mode: predict
-debug: False
 load_ckpt: checkpoint_selection_straightpcf/best_checkpoint.pkl
 
 components:

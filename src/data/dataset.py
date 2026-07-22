@@ -54,7 +54,6 @@ class PCDatasetModule():
         train_transform: Optional[Transform]=None,
         validate_transform: Optional[Transform]=None,
         predict_transform: Optional[Transform]=None,
-        debug: bool=False,
     ):
         self.process_fn                 = process_fn
         self.train_dataset_config       = train_dataset_config
@@ -63,11 +62,6 @@ class PCDatasetModule():
         self.train_transform            = train_transform
         self.validate_transform         = validate_transform
         self.predict_transform          = predict_transform
-        self.debug = debug
-        
-        if debug:
-            print("\033[31mWARNING: debug mode\033[0m")
-        
         # build train datapath
         if self.train_dataset_config is not None:
             self.train_datapath = self.train_dataset_config.datapath
@@ -99,7 +93,6 @@ class PCDatasetModule():
                 transform=self.train_transform,
                 name="train",
                 process_fn=self.process_fn,
-                debug=self.debug,
             )
         else:
             return None
@@ -117,7 +110,6 @@ class PCDatasetModule():
                     transform=self.validate_transform,
                     name=f"validate-{cls}",
                     process_fn=self.process_fn,
-                    debug=self.debug,
                 )
         else:
             return None
@@ -135,7 +127,6 @@ class PCDatasetModule():
                     transform=self.predict_transform,
                     name=f"predict-{cls}",
                     process_fn=self.process_fn,
-                    debug=self.debug,
                 )
         else:
             return None
@@ -177,7 +168,6 @@ class PCDataset(Dataset):
         transform: Transform,
         name: Optional[str]=None,
         process_fn: Optional[Callable[[List[Asset]], List[Dict]]]=None,
-        debug: bool=False,
     ):
         super().__init__()
         
@@ -185,10 +175,7 @@ class PCDataset(Dataset):
         self.name       = name
         self.process_fn = process_fn
         self.transform  = transform
-        self.debug      = debug
-        
-        if not debug:
-            assert self.process_fn is not None, 'missing data processing function'
+        assert self.process_fn is not None, 'missing data processing function'
     
     def __len__(self) -> int:
         return len(self.data)
@@ -198,9 +185,6 @@ class PCDataset(Dataset):
         asset = lazy_asset.load()
         self.transform.apply(asset=asset)
         return asset
-    
-    def _collate_fn_debug(self, batch):
-        return batch # just retun a list of Asset
     
     def _collate_fn(self, batch):
         processed_batch = self.process_fn(batch) # type: ignore
@@ -263,6 +247,4 @@ class PCDataset(Dataset):
         return collated_batch
     
     def collate_batch(self, batch):
-        if self.debug:
-            return self._collate_fn_debug(batch)
         return self._collate_fn(batch)

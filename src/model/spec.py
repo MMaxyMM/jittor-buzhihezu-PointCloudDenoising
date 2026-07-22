@@ -7,7 +7,6 @@ from omegaconf import OmegaConf
 from typing import Dict, List, Optional, final
 
 import numpy as np
-import os
 import jittor as jt
 
 from ..data.asset import Asset
@@ -47,8 +46,7 @@ class ModelSpec(nn.Module, ABC):
     @final
     def _process_fn(self, batch: List[Asset]) -> List[Dict]:
         n_batch = self.process_fn(batch)
-        DEBUG = os.getenv("DEBUG") == "1"
-        if DEBUG or not self.is_training():
+        if not self.is_training():
             for k in n_batch[0].keys():
                 if not isinstance(n_batch[0][k], ndarray) and not isinstance(n_batch[0][k], jt.Var):
                     continue
