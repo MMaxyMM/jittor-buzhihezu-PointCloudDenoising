@@ -7,7 +7,7 @@ decoder_hidden_dim: 64
 num_modules: 4
 total_iterations: 3
 consistency_weight: 10.0
-init_velocity_ckpt: BestModel/baseline/best_checkpoint.pkl
+init_velocity_ckpt: checkpoint_selection_cached/best_checkpoint.pkl
 patch_size: 1000
 seed_k: 6
 seed_k_alpha: 1

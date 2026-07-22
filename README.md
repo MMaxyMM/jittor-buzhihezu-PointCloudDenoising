@@ -35,6 +35,31 @@ python -m pip install -r requirements.txt
 pip install point-cloud-utils
 ```
 
+### 多 worker 训练时限制 CPU 线程
+
+当 DataLoader 使用较多 `num_workers` 时，NumPy/BLAS 可能让每个 worker 再创建多个计算线程，造成 CPU 过度订阅。先在当前终端中加载脚本：
+
+```bash
+source scripts/run_single_thread.sh
+```
+
+然后继续使用原来的训练命令，例如：
+
+```bash
+python run.py --task configs/task/train_cvm_cached.yaml
+```
+
+脚本只为当前终端设置以下变量，不会自动启动训练，也不会修改配置文件：
+
+```text
+OMP_NUM_THREADS=1
+MKL_NUM_THREADS=1
+OPENBLAS_NUM_THREADS=1
+NUMEXPR_NUM_THREADS=1
+```
+
+必须使用 `source`（或 `. scripts/run_single_thread.sh`），直接执行脚本无法修改当前终端的环境变量。关闭终端后设置会自动失效。
+
 ## 数据准备
 
 将官方训练集和测试集放在项目根目录：
@@ -366,7 +391,7 @@ result.zip
 本分支补齐了 StraightPCF 的后两个训练阶段。完整训练顺序不可交换：
 
 1. 训练单个 VelocityModule（已有 baseline）。
-2. 将同一个 baseline 权重复制初始化多个 VelocityModule，联合训练 Coupled VelocityModule（CVM）。
+2. 将同一个第一阶段 VM 最优权重复制初始化多个 VelocityModule，联合训练 Coupled VelocityModule（CVM）。
 3. 加载训练完成的 CVM，冻结其参数，训练 DistanceModule 和最终位置损失。
 
 实现仍使用 Jittor，输入和输出点数完全相同。正式训练使用缓存 clean point cloud，但噪声、patch 和时间步仍在每次取样时动态生成。
@@ -394,22 +419,22 @@ experiments/straightpcf_debug/checkpoint_0.pkl
 
 这两个 checkpoint 只用于验证代码链路，不应作为正式提交权重。
 
-### 第一阶段：准备 baseline VelocityModule
+### 第一阶段：准备 VelocityModule 最优权重
 
-默认 CVM 配置从以下文件初始化四个 VelocityModule：
+默认 CVM 配置从最新的缓存版 Charbonnier VM 最优权重初始化四个 VelocityModule：
 
 ~~~text
-BestModel/baseline/best_checkpoint.pkl
+checkpoint_selection_cached/best_checkpoint.pkl
 ~~~
 
 对应配置位于 configs/model/cvm.yaml：
 
 ~~~yaml
-init_velocity_ckpt: BestModel/baseline/best_checkpoint.pkl
+init_velocity_ckpt: checkpoint_selection_cached/best_checkpoint.pkl
 num_modules: 4
 ~~~
 
-如果 baseline best 文件位于其他目录，请先修改 init_velocity_ckpt。
+如果 VM 最优权重位于其他目录，请先修改 init_velocity_ckpt。
 
 如需重新训练 baseline：
 
