@@ -9,8 +9,9 @@ import numpy as np
 import os
 import random
 
-from src.data.dataset import DatasetConfig, DatasetConfig, PCDatasetModule
+from src.data.dataset import DatasetConfig, PCDatasetModule
 from src.data.transform import Transform
+from src.config_override import apply_overrides
 from src.model.parse import get_model
 from src.system.parse import get_system, get_writer
 
@@ -26,6 +27,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--seed", type=int, required=False, default=123)
+    parser.add_argument(
+        "--model_override",
+        action="append",
+        default=[],
+        help="Override model config values, e.g. num_inference_steps=8",
+    )
     args = parser.parse_args()
     
     # seed all
@@ -71,6 +78,7 @@ if __name__ == "__main__":
         model = None
     else:
         model_config = load('model', os.path.join('configs/model', model_config))
+        model_config = apply_overrides(model_config, args.model_override)
         model = get_model(model_config=model_config, transform_config=transform_config)
     
     train_transform = (Transform.parse(**transform_config.get('train_transform', {}))) if model is None else model.get_train_transform()

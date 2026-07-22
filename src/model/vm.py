@@ -1,10 +1,10 @@
-from math import ceil
 from typing import Dict, List
 
 import jittor as jt
 import numpy as np
 
 from .feature import FeatureExtraction, Decoder
+from .patch_inference import patch_based_denoise
 from .spec import ModelSpec
 
 from ..data.asset import Asset
@@ -26,6 +26,10 @@ class VelocityModule(ModelSpec):
         
         # score-matching
         self.dsm_sigma = cfg['dsm_sigma']
+        self.patch_size = int(cfg.get('patch_size', 1000))
+        self.seed_k = int(cfg.get('seed_k', 6))
+        self.seed_k_alpha = int(cfg.get('seed_k_alpha', 1))
+        self.num_inference_steps = int(cfg.get('num_inference_steps', 4))
         
         # networks
         self.encoder = FeatureExtraction(
@@ -75,10 +79,12 @@ class VelocityModule(ModelSpec):
 
         return loss
 
-    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=4):
+    def denoise_langevin_dynamics(self, pcl_noisy, num_steps: int=None):
         """
         pcl_noisy: (B, N, 3)
         """
+        if num_steps is None:
+            num_steps = self.num_inference_steps
         B, N, d = pcl_noisy.shape
         with jt.no_grad():
             pcl_next = pcl_noisy.clone()
@@ -123,9 +129,10 @@ class VelocityModule(ModelSpec):
                 pc_out = patch_based_denoise(
                     model=self,
                     pcl_noisy=pc_next,
-                    patch_size=1000,
-                    seed_k=6,
-                    seed_k_alpha=1,
+                    patch_size=self.patch_size,
+                    seed_k=self.seed_k,
+                    seed_k_alpha=self.seed_k_alpha,
+                    inner_steps=self.num_inference_steps,
                 )
                 if pc_out is None:
                     # patch 推理失败时回退上一步结果，保证输出完整
@@ -153,110 +160,3 @@ class VelocityModule(ModelSpec):
                     d["pc_clean"] = b.sampled_vertices
                 res.append(d)
         return res
-
-def farthest_point_sampling(pcls, num_pnts):
-    """
-    pcls: (B, N, 3)
-    return:
-        sampled: (B, num_pnts, 3)
-        indices: (B, num_pnts)
-    """
-    B, N, _ = pcls.shape
-    sampled = []
-    indices = []
-    for b in range(B):
-        pts = pcls[b]  # (N, 3)
-        selected = []
-        dist = jt.ones((N,)) * 1e10
-        farthest = 0
-        for i in range(num_pnts):
-            selected.append(farthest)
-            centroid = pts[farthest]  # (3,)
-            d = ((pts - centroid) ** 2).sum(dim=1)
-            dist = jt.minimum(dist, d)
-            farthest, _ = jt.argmax(dist, dim=-1)
-            farthest = farthest.item()
-        idx = jt.array(selected).int32()
-        sampled.append(pts[idx][None, ...])
-        indices.append(idx[None, ...])
-    sampled = jt.concat(sampled, dim=0)
-    indices = jt.concat(indices, dim=0)
-    return sampled, indices
-
-def knn_points(x, y, k):
-    """
-    x: (B, P, 3)
-    y: (B, N, 3)
-    return:
-        dist: (B, P, k)
-        idx:  (B, P, k)
-        nn:   (B, P, k, 3)
-    """
-    dist = ((x.unsqueeze(2) - y.unsqueeze(1)) ** 2).sum(-1)
-    dist_k, idx = jt.topk(dist, k=k, dim=-1, largest=False)
-    B = x.shape[0]
-    nn = []
-    for b in range(B):
-        nn.append(y[b][idx[b]])
-    nn = jt.stack(nn, dim=0)
-    return dist_k, idx, nn
-
-def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_k=6, seed_k_alpha=1) -> jt.Var:
-    """
-    pcl_noisy: (N, 3)
-    """
-    assert len(pcl_noisy.shape) == 2
-    
-    N, d = pcl_noisy.shape
-    num_patches = int(seed_k * N / patch_size)
-    pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
-    
-    seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
-    patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
-
-    patches = patches[0]              # (P, M, 3)
-    patch_dists = patch_dists[0]      # (P, M)
-    point_idxs = point_idxs[0]        # (P, M)
-
-    seed_expand = seed_pnts.squeeze().unsqueeze(1).broadcast(patches.shape)
-    patches = patches - seed_expand
-
-    patch_dists = patch_dists / (patch_dists[:, -1:].broadcast(patch_dists.shape) + 1e-8)
-
-    i = 0
-    patch_step = int(ceil(N / (seed_k_alpha * patch_size)))
-    assert patch_step > 0
-    patches_denoised = []
-    while i < num_patches:
-        curr = patches[i:i+patch_step]
-        try:
-            out, _ = model.denoise_langevin_dynamics(curr)
-        except Exception as e:
-            print("Denoise error:", e)
-            return None
-        patches_denoised.append(out)
-        i += patch_step
-
-    patches_denoised = jt.concat(patches_denoised, dim=0)
-    patches_denoised = patches_denoised + seed_expand
-    pcl_original = pcl_noisy.squeeze(0)
-
-    # 按 exp(-dist) 权重对所有覆盖该点的 patch 预测做加权融合，
-    # 而非只取单个最佳 patch：平均多个预测可抑制拉普拉斯重尾造成的离群估计，
-    # 同时用 scatter 向量化，替代逐点 Python 循环
-    flat_idx = point_idxs.reshape(-1)                                    # (P*M,)
-    flat_w = jt.exp(-patch_dists).reshape(-1, 1)                         # (P*M, 1)
-    flat_pred = patches_denoised.reshape(-1, 3) * flat_w                 # (P*M, 3)
-    num_flat = flat_idx.shape[0]
-
-    pred_sum = jt.zeros((N, 3)).scatter_(
-        0, flat_idx.unsqueeze(1).broadcast((num_flat, 3)), flat_pred, reduce='add'
-    )
-    weight_sum = jt.zeros((N, 1)).scatter_(
-        0, flat_idx.unsqueeze(1).broadcast((num_flat, 1)), flat_w, reduce='add'
-    )
-
-    covered = (weight_sum > 1e-12).broadcast((N, 3))
-    pcl_fused = pred_sum / (weight_sum + 1e-12)
-    pcl_out = jt.where(covered, pcl_fused, pcl_original)
-    return pcl_out

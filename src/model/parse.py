@@ -1,10 +1,12 @@
 from .spec import ModelSpec
+from .residual_diffusion import ResidualDiffusionModule
 from .vm import VelocityModule
 from .straightpcf import CoupledVelocityModule, StraightPCFModule
 
 def get_model(model_config, **kwargs) -> ModelSpec:
     MAP = {
         'VelocityModule': VelocityModule,
+        'ResidualDiffusionModule': ResidualDiffusionModule,
         'CoupledVelocityModule': CoupledVelocityModule,
         'StraightPCFModule': StraightPCFModule,
     }

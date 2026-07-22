@@ -22,6 +22,7 @@ import json
 import random
 import re
 import shutil
+import time
 import traceback
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -30,9 +31,13 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
+from src.config_override import apply_overrides
+
 
 MODEL_TARGET_FALLBACK = {
     "vm": "VelocityModule",
+    "residual_diffusion": "ResidualDiffusionModule",
+    "direct_residual": "ResidualDiffusionModule",
 }
 
 
@@ -189,6 +194,7 @@ def build_validation_context(args) -> Dict:
 
     transform_config = load_yaml(transform_path)
     model_config = ensure_model_target(load_yaml(model_path), components["model"])
+    model_config = apply_overrides(model_config, args.model_override)
     system_config = ensure_system_target(load_yaml(system_path), components["system"])
 
     validate_dataset_config = DatasetConfig.parse(**validate_config).split_by_cls()
@@ -245,7 +251,6 @@ def evaluate_checkpoint(ckpt_path: Path, context: Dict, log_path: Path) -> Tuple
                 train_transform=None,
                 validate_transform=context["validate_transform"],
                 predict_transform=None,
-                debug=False,
             )
 
             system = get_system(
@@ -339,6 +344,10 @@ def evaluate_checkpoint_cd(ckpt_path: Path, context: Dict, log_path: Path, args)
             model.eval()
 
             cds: List[float] = []
+            noisy_cds: List[float] = []
+            cd_scores: List[float] = []
+            inference_seconds: List[float] = []
+            displacement_p95: List[float] = []
             sample_index = 0
             for cls, ds_config in context["validate_dataset_config"].items():
                 for lazy_asset in ds_config.datapath.get_data():
@@ -356,16 +365,35 @@ def evaluate_checkpoint_cd(ckpt_path: Path, context: Dict, log_path: Path, args)
                     noise = rs.laplace(0.0, noise_std / np.sqrt(2.0), size=clean.shape)
                     noisy = (clean + noise).astype(np.float32)
 
+                    started_at = time.perf_counter()
                     pred = model.predict_step({"pc_noisy": jt.array(noisy[None])})
                     denoised = pred[0]["pc_denoised"]
+                    inference_seconds.append(time.perf_counter() - started_at)
                     cd = _chamfer_distance(denoised, clean)
                     cd_noisy = _chamfer_distance(noisy, clean)
                     cds.append(cd)
+                    noisy_cds.append(cd_noisy)
+                    cd_scores.append(
+                        float(np.clip(100.0 * (1.0 - cd / cd_noisy), 0.0, 100.0))
+                    )
+                    displacement_p95.append(
+                        float(np.percentile(np.linalg.norm(denoised - noisy, axis=1), 95))
+                    )
                     print(f"sample {sample_index} ({asset.path}): cd={cd:.8f} cd_noisy={cd_noisy:.8f} improve={100*(1-cd/cd_noisy):.2f}")
                     sample_index += 1
 
             mean_cd = mean(cds)
             metrics = {"val/cd_mean": mean_cd} if mean_cd is not None else {}
+            if noisy_cds:
+                metrics.update({
+                    "val/noisy_cd_mean": mean(noisy_cds),
+                    "val/cd_score_mean": mean(cd_scores),
+                    "val/inference_seconds_mean": mean(inference_seconds),
+                    "val/displacement_p95_mean": mean(displacement_p95),
+                    "model/parameters": float(
+                        sum(int(np.prod(parameter.shape)) for parameter in model.parameters())
+                    ),
+                })
             print(json.dumps(metrics, indent=2, ensure_ascii=False))
             if hasattr(jt, "gc"):
                 jt.gc()
@@ -441,6 +469,12 @@ def main() -> int:
     parser.add_argument("--output_dir", default="checkpoint_selection", help="Directory for logs and rankings.")
     parser.add_argument("--use_cuda", type=int, default=1, help="Jittor CUDA flag.")
     parser.add_argument("--seed", type=int, default=123, help="Random seed.")
+    parser.add_argument(
+        "--model_override",
+        action="append",
+        default=[],
+        help="Override model config values, e.g. num_inference_steps=8",
+    )
     parser.add_argument("--start_epoch", type=int, default=None, help="Only evaluate checkpoints with epoch >= this value.")
     parser.add_argument("--end_epoch", type=int, default=None, help="Only evaluate checkpoints with epoch <= this value.")
     parser.add_argument("--limit", type=int, default=None, help="Evaluate at most this many checkpoints after filtering.")

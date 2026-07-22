@@ -1,0 +1,13 @@
+mode: predict
+load_ckpt: checkpoint_selection_residual_diffusion/best_checkpoint.pkl
+
+components:
+  data: predict
+  transform: predict
+  system: residual_diffusion
+  model: residual_diffusion
+
+writer:
+  __target__: vm
+  save_dir: results_residual_diffusion
+  save_name: denoised

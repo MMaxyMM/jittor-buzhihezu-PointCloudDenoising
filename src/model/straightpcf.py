@@ -9,8 +9,9 @@ from jittor import nn
 
 from ..data.asset import Asset
 from .feature import Decoder, FeatureExtraction
+from .patch_inference import patch_based_denoise
 from .spec import ModelSpec
-from .vm import VelocityModule, patch_based_denoise
+from .vm import VelocityModule
 
 
 def _charbonnier_vector_loss(diff, eps: float = 1e-12):

@@ -1,0 +1,13 @@
+mode: predict
+load_ckpt: checkpoint_selection_direct_residual/best_checkpoint.pkl
+
+components:
+  data: predict
+  transform: predict
+  system: direct_residual
+  model: direct_residual
+
+writer:
+  __target__: vm
+  save_dir: results_direct_residual
+  save_name: denoised

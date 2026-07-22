@@ -4,3 +4,7 @@ num_train_points: 128
 feat_embedding_dim: 256
 decoder_hidden_dim: 64
 dsm_sigma: 0.01
+patch_size: 1000
+seed_k: 6
+seed_k_alpha: 1
+num_inference_steps: 4

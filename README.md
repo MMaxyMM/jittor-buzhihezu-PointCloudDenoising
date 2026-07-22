@@ -10,23 +10,29 @@
 
 三维传感（LiDAR、结构光、深度相机等）获取的点云常受传感器误差、环境干扰与量化误差影响，点偏离真实表面，损害重建、法向估计、识别等下游任务。
 
-**任务**：输入含噪点 \(\{p_i + n_i\}_{i=1}^{N}\)，预测位移 \(\Delta_i\)，使降噪点 \(\hat{p}_i = p_i + n_i + \Delta_i\) 尽可能贴近真实表面。可建模为逐点位移回归，或分数匹配 / 扩散式去噪。
+**任务**：输入含噪点 p_i + n_i_{i=1}^{N}，预测位移 \Delta_i，使降噪点 \hat{p}_i = p_i + n_i + \Delta_i 尽可能贴近真实表面。可建模为逐点位移回归，或分数匹配 / 扩散式去噪。
 
 **主要挑战**：噪声分布多样、尖锐细节保持、大规模点云可扩展性、跨类别泛化。
 
 ---
 
+
+
 ## 2. 数据说明
 
-| 资源 | 文件 |
-|------|------|
-| A 榜训练集（干净网格） | `dataset_train.tar.gz` |
-| A 榜测试集（含噪点云） | `dataset_test_noisy.zip` |
-| Baseline / Starter Code | `starter_code.zip` |
+
+| 资源                      | 文件                       |
+| ----------------------- | ------------------------ |
+| A 榜训练集（干净网格）            | `dataset_train.tar.gz`   |
+| A 榜测试集（含噪点云）            | `dataset_test_noisy.zip` |
+| Baseline / Starter Code | `starter_code.zip`       |
+
 
 - **A 榜**：中等规模 ShapeNet 子集（飞机、椅子、桌子、汽车等），每样本约 50,000 点，噪声标准差 0.005～0.020（单位球归一化后）。
 - **B 榜**：更大规模、更多类别与更高噪声，需兼顾效率；AB 榜算法应基本一致。
 - **禁止**使用提供数据集以外的数据，否则取消资格。
+
+
 
 ### 目录结构
 
@@ -50,6 +56,8 @@ dataset_test_noisy/
 shapenet/04401088/d7ed512f7a7daf63772afc88105fa679
 ```
 
+
+
 ### 数据准备
 
 ```bash
@@ -59,22 +67,30 @@ unzip dataset_test_noisy.zip
 
 ---
 
+
+
 ## 3. Baseline 架构
 
-| 模块 | 说明 |
-|------|------|
+
+| 模块   | 说明                                       |
+| ---- | ---------------------------------------- |
 | 特征提取 | 动态图卷积（Dynamic Edge Convolution）+ KNN 局部图 |
-| 位移解码 | MLP → 三维位移向量 |
-| 训练目标 | 监督学习：含噪点相对干净点的位移回归 |
-| 推理 | Patch 分块降噪 + 加权融合，适配大规模点云 |
+| 位移解码 | MLP → 三维位移向量                             |
+| 训练目标 | 监督学习：含噪点相对干净点的位移回归                       |
+| 推理   | Patch 分块降噪 + 加权融合，适配大规模点云                |
+
+
+
 
 ### 本仓库相对官方 starter 的适配
 
-1. **噪声建模**（`src/data/augment.py`）：`noise_type` 支持 `laplace`（默认）与 `gaussian`。配置中 `noise_std_min/max` 表示噪声标准差；拉普拉斯采样时换算为尺度 \(b = \mathrm{std}/\sqrt{2}\)。
-2. **损失函数**（`src/model/vm.py`、`src/model/straightpcf.py`）：三阶段统一使用 Charbonnier（平滑 L1）损失 \(\sqrt{\|d\|^2 + \varepsilon}\)，对重尾噪声更鲁棒。
-3. **推理融合**（`src/model/vm.py`）：多 patch 按 \(\exp(-\mathrm{dist})\) 加权融合，并用 scatter 向量化加速。
+1. **噪声建模**（`src/data/augment.py`）：`noise_type` 支持 `laplace`（默认）与 `gaussian`。配置中 `noise_std_min/max` 表示噪声标准差；拉普拉斯采样时换算为尺度 b = \mathrm{std}/\sqrt{2}。
+2. **损失函数**（`src/model/vm.py`、`src/model/straightpcf.py`）：三阶段统一使用 Charbonnier（平滑 L1）损失 \sqrt{d^2 + \varepsilon}，对重尾噪声更鲁棒。
+3. **推理融合**（`src/model/vm.py`）：多 patch 按 \exp(-\mathrm{dist}) 加权融合，并用 scatter 向量化加速。
 
 ---
+
+
 
 ## 4. 环境安装
 
@@ -104,6 +120,8 @@ export nvcc_path="/usr/local/cuda/bin/nvcc"
 python3 -m jittor.test.test_cuda
 ```
 
+
+
 ### 多 worker 训练时限制 CPU 线程
 
 DataLoader `num_workers` 较大时，NumPy/BLAS 可能造成 CPU 过度订阅。训练前在当前终端执行：
@@ -116,7 +134,11 @@ source scripts/run_single_thread.sh
 
 ---
 
+
+
 ## 5. 训练
+
+
 
 ### 5.1 原始 OBJ 训练
 
@@ -192,7 +214,52 @@ python run.py --task configs/task/train_straightpcf_cached.yaml
 
 对应 checkpoint 目录：`experiments/vm`、`experiments/cvm`、`experiments/straightpcf`。
 
+### 5.4 条件残差扩散与消融模型
+
+扩散分支保持训练数据、patch 划分和提交格式不变，在归一化残差
+`r0 = (clean - noisy) / noise_std` 上训练条件扩散模型。默认使用
+DGCNN-like 编码器、v-prediction、`0.1 × L1` 辅助项和 4 步确定性
+DDIM；测试时默认噪声条件为 0.0125，也可在模型配置中将
+`inference_noise_mode` 改为 `estimate`。
+
+```bash
+# 同 backbone 的直接端点残差基线
+python run.py --task configs/task/train_direct_residual_cached.yaml
+
+# DGCNN 条件残差扩散（首选实验）
+python run.py --task configs/task/train_residual_diffusion_cached.yaml
+
+# 仅在 DGCNN 扩散通过验证门槛后比较局部 Point Transformer
+python run.py --task configs/task/train_direct_residual_point_transformer_cached.yaml
+python run.py --task configs/task/train_residual_diffusion_point_transformer_cached.yaml
+```
+
+在正式训练前可用一个真实缓存样本完成 GPU 前向、反向和优化器冒烟测试：
+
+```bash
+python scripts/smoke_diffusion_pipeline.py --use_cuda 1
+```
+
+模型配置中的 `num_inference_steps` 可用于比较 1/2/4/8/16 步；
+`prediction_type` 支持 `v` 与 `epsilon`；`condition_on_time` 和
+`condition_on_observation_std` 可关闭以完成条件消融。训练系统还支持
+可选的 `adamw`、`gradient_clip_norm`、`ema_decay` 以及
+`scheduler: cosine` + `warmup_ratio`，默认配置仍使用 Adam，以免混淆
+扩散机制与优化器收益。
+
+`run.py` 与 `select_best_checkpoint.py` 均支持重复传入
+`--model_override key=value`，例如使用同一权重比较 8 步采样：
+
+```bash
+python select_best_checkpoint.py \
+  --ckpt_dir experiments/residual_diffusion \
+  --task_template configs/task/train_residual_diffusion_cached.yaml \
+  --metric cd --model_override num_inference_steps=8
+```
+
 ---
+
+
 
 ## 6. 选择最佳 Checkpoint
 
@@ -237,7 +304,11 @@ python scripts/estimate_noise_level.py --input_dir dataset_test_noisy
 
 ---
 
+
+
 ## 7. 推理与提交
+
+
 
 ### 推理
 
@@ -296,12 +367,9 @@ print('验证通过：所有 denoised.npy 的 shape、dtype 和数值均正常')
 PY
 ```
 
-### 打包提交
 
-```bash
-cd results/dataset_test_noisy
-zip -r ../../result.zip shapenet/
-```
+
+### 打包提交
 
 ```text
 result.zip
@@ -320,18 +388,20 @@ np.save("denoised.npy", denoised_points.astype(np.float32))
 
 ---
 
+
+
 ## 8. 评测指标
 
 计算前将真实点云归一化至单位球（中心化 + 最大半径为 1），预测点施加相同变换。
 
 ### Chamfer Distance (CD)
 
-预测点云与真实干净点云之间的双向平均最近邻距离之和，越小越好。
+预测点云与真实干净点云之间的双向平均最近邻**平方距离**之和，越小越好；本项目的 `evaluate.py` 与 checkpoint CD 筛选均按此口径计算。
 
 \[
 \mathrm{CD}(S_{\mathrm{pred}}, S_{\mathrm{gt}})
-= \frac{1}{|S_{\mathrm{pred}}|}\sum_{x\in S_{\mathrm{pred}}}\min_{y\in S_{\mathrm{gt}}}\|x-y\|_2
-+ \frac{1}{|S_{\mathrm{gt}}|}\sum_{y\in S_{\mathrm{gt}}}\min_{x\in S_{\mathrm{pred}}}\|y-x\|_2
+= \frac{1}{|S_{\mathrm{pred}}|}\sum_{x\in S_{\mathrm{pred}}}\min_{y\in S_{\mathrm{gt}}}\|x-y\|_2^2
++ \frac{1}{|S_{\mathrm{gt}}|}\sum_{y\in S_{\mathrm{gt}}}\min_{x\in S_{\mathrm{pred}}}\|y-x\|_2^2
 \]
 
 ### Point-to-Surface (P2S)
@@ -348,11 +418,11 @@ np.save("denoised.npy", denoised_points.astype(np.float32))
 以含噪输入为零分基线：
 
 \[
-\mathrm{cd\_score}_i = \mathrm{clamp}\!\left(100\times\left(1-\frac{\mathrm{CD}_{\mathrm{pred}}^{(i)}}{\mathrm{CD}_{\mathrm{noisy}}^{(i)}}\right),\,0,\,100\right)
+\mathrm{cd\_score}_i = \mathrm{clamp}\left(100\times\left(1-\frac{\mathrm{CD}_{\mathrm{pred}}^{(i)}}{\mathrm{CD}_{\mathrm{noisy}}^{(i)}}\right),0,100\right)
 \]
 
 \[
-\mathrm{p2s\_score}_i = \mathrm{clamp}\!\left(100\times\left(1-\frac{\mathrm{P2S}_{\mathrm{pred}}^{(i)}}{\mathrm{P2S}_{\mathrm{noisy}}^{(i)}}\right),\,0,\,100\right)
+\mathrm{p2s\_score}_i = \mathrm{clamp}\left(100\times\left(1-\frac{\mathrm{P2S}_{\mathrm{pred}}^{(i)}}{\mathrm{P2S}_{\mathrm{noisy}}^{(i)}}\right),0,100\right)
 \]
 
 **A 榜最终分**：全部测试样本上 CD 得分与 P2S 得分各取全局平均，再按 **50% / 50%** 加权。
@@ -374,6 +444,8 @@ python evaluate.py \
 `--mesh_dir` 用于 P2S（需 `point-cloud-utils`）；省略则仅算 CD。
 
 ---
+
+
 
 ## 9. 注意事项
 

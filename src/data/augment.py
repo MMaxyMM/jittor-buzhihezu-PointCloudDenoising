@@ -115,6 +115,9 @@ class AugmentAddNoise(Augment):
         else:
             raise ValueError(f"unsupported noise_type: {self.noise_type}")
         asset.sampled_vertices_noisy = (pc + noise).astype(np.float32, copy=False)
+        if asset.meta is None:
+            asset.meta = {}
+        asset.meta["noise_std"] = np.float32(noise_std)
 
 @dataclass(frozen=True)
 class AugmentLinear(Augment):
@@ -153,6 +156,13 @@ class AugmentLinear(Augment):
             scale[2, 2] = np.random.uniform(self.scale[0], self.scale[1])
             scale[3, 3] = 1.0
             trans_vertex = scale @ trans_vertex
+            if asset.meta is not None and "noise_std" in asset.meta:
+                # An anisotropic scale no longer has one exact scalar std.
+                # Use its RMS axis scale as a stable global condition.
+                rms_scale = float(np.sqrt(np.mean(np.diag(scale)[:3] ** 2)))
+                asset.meta["noise_std"] = np.float32(
+                    float(asset.meta["noise_std"]) * rms_scale
+                )
         asset.transform(trans_vertex)
 
 @dataclass(frozen=True)
@@ -186,6 +196,9 @@ class AugmentPatch(Augment):
 
         pat_A = pc_noisy[nn_idx].astype(np.float32, copy=False)  # (P, M, 3)
         pat_B = pc[nn_idx].astype(np.float32, copy=False)        # (P, M, 3)
+        noise_std = np.float32(
+            asset.meta.get("noise_std", 0.0) if asset.meta is not None else 0.0
+        )
 
         if self.train_cvm_network:
             # CVM and DistanceModule share one interpolation time per patch.
@@ -200,6 +213,9 @@ class AugmentPatch(Augment):
             asset.meta['pc_clean'] = pat_B
             asset.meta['seed_points_t'] = seed_points_t[:, None, :]
             asset.meta['original_time_step'] = t
+            asset.meta['noise_std'] = np.full(
+                (self.num_patches, 1), noise_std, dtype=np.float32
+            )
             return
 
         l1, l2 = 1e-8, 1.0
@@ -221,6 +237,9 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['pc_mix'] = pat_t
+        asset.meta['noise_std'] = np.full(
+            (self.num_patches, 1), noise_std, dtype=np.float32
+        )
 
 def get_augments(*args) -> List[Augment]:
     MAP = {

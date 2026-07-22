@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 from tqdm import tqdm
 
 import jittor as jt
+import math
 import os
 
 from ..data.asset import Asset
@@ -20,6 +21,7 @@ def get_optimizer(optimizer_config, model):
     MAPPING = {
         'sgd': optim.SGD,
         'adam': optim.Adam,
+        'adamw': optim.AdamW,
     }
     if __target__ not in MAPPING:
         raise ValueError(f"unsupported optimizer: {__target__}")
@@ -58,11 +60,28 @@ class DummySystem():
         if trainer_config is None:
             trainer_config = {}
         self.epochs = trainer_config.get('epochs', 1)
+        self.scheduler = trainer_config.get('scheduler', None)
+        self.warmup_ratio = float(trainer_config.get('warmup_ratio', 0.0))
+        self.min_lr_ratio = float(trainer_config.get('min_lr_ratio', 0.0))
+        self.gradient_clip_norm = trainer_config.get('gradient_clip_norm', None)
+        self.ema_decay = float(trainer_config.get('ema_decay', 0.0))
+        self._global_step = 0
         
         if optimizer_config is not None and model is not None:
             self.optimizer = get_optimizer(optimizer_config, model)
         else:
             self.optimizer = None
+        self.base_lr = (
+            float(self.optimizer.lr) if self.optimizer is not None else 0.0
+        )
+        self._ema_parameters = None
+        if self.ema_decay > 0.0:
+            if not 0.0 < self.ema_decay < 1.0:
+                raise ValueError("ema_decay must be in (0, 1)")
+            self._ema_parameters = [
+                parameter.detach().clone()
+                for parameter in self.model.parameters()
+            ]
         
         self._validation_loss = defaultdict(list)
     
@@ -127,7 +146,49 @@ class DummySystem():
         pass
     
     def on_before_optimizer_step(self, optimizer):
-        pass
+        if self.gradient_clip_norm is not None:
+            optimizer.clip_grad_norm(float(self.gradient_clip_norm))
+
+    def _update_learning_rate(self, total_steps):
+        if self.optimizer is None or self.scheduler is None:
+            return
+        progress = self._global_step / max(total_steps - 1, 1)
+        if self.warmup_ratio > 0.0 and progress < self.warmup_ratio:
+            factor = max(progress / self.warmup_ratio, 1.0 / max(total_steps, 1))
+        elif self.scheduler == "cosine":
+            post_warmup = (progress - self.warmup_ratio) / max(
+                1.0 - self.warmup_ratio, 1e-8
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * post_warmup))
+            factor = self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
+        else:
+            raise ValueError(f"unsupported scheduler: {self.scheduler}")
+        self.optimizer.lr = self.base_lr * factor
+
+    def _update_ema(self):
+        if self._ema_parameters is None:
+            return
+        with jt.no_grad():
+            for ema_parameter, parameter in zip(
+                self._ema_parameters, self.model.parameters()
+            ):
+                ema_parameter.assign(
+                    self.ema_decay * ema_parameter
+                    + (1.0 - self.ema_decay) * parameter.detach()
+                )
+
+    def _save_checkpoint(self, checkpoint_path):
+        if self._ema_parameters is None:
+            self.model.save(checkpoint_path)
+            return
+        with jt.no_grad():
+            parameters = list(self.model.parameters())
+            backup = [parameter.detach().clone() for parameter in parameters]
+            for parameter, ema_parameter in zip(parameters, self._ema_parameters):
+                parameter.assign(ema_parameter)
+            self.model.save(checkpoint_path)
+            for parameter, original in zip(parameters, backup):
+                parameter.assign(original)
     
     def on_predict_epoch_start(self):
         pass
@@ -147,6 +208,12 @@ class DummySystem():
     def train(self):
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
+        train_dataloader = self.dataset_module.train_dataloader()
+        assert train_dataloader is not None, "train_dataloader is None"
+        steps_per_epoch = max(
+            1, len(train_dataloader) // train_dataloader.batch_size
+        )
+        total_steps = self.epochs * steps_per_epoch
         for epoch in range(self.epochs):
             self.model.train()
             self.on_train_epoch_start()
@@ -155,12 +222,15 @@ class DummySystem():
             pbar = tqdm(train_dataloader, total=len(train_dataloader)//train_dataloader.batch_size) # type: ignore
             for batch in pbar:
                 self.on_train_batch_start()
+                self._update_learning_rate(total_steps)
                 loss = self.training_step(batch)
                 self.optimizer.zero_grad()
                 self.optimizer.backward(loss)
                 pbar.set_description(f"Epoch {epoch}, Loss: {_get_item(loss)}")
                 self.on_before_optimizer_step(self.optimizer)
                 self.optimizer.step()
+                self._update_ema()
+                self._global_step += 1
                 self.on_train_batch_end()
             self.on_train_epoch_end()
             
@@ -187,7 +257,7 @@ class DummySystem():
             
             checkpoint_path = os.path.join(self.ckpt_save_dir, f'{self.ckpt_save_name}_{epoch}.pkl')
             os.makedirs(self.ckpt_save_dir, exist_ok=True)
-            self.model.save(checkpoint_path)
+            self._save_checkpoint(checkpoint_path)
     
     def predict(self):
         # only iterate once

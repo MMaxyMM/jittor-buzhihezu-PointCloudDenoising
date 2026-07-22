@@ -1,0 +1,17 @@
+mode: train
+
+components:
+  data: train_cached
+  transform: residual_diffusion
+  system: residual_diffusion
+  model: residual_diffusion
+
+loss:
+  loss: 1.0
+
+optimizer:
+  __target__: adam
+  lr: 0.0001
+
+trainer:
+  epochs: 100
