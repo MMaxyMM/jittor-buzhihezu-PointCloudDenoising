@@ -353,7 +353,8 @@ def evaluate_checkpoint_cd(ckpt_path: Path, context: Dict, log_path: Path, args)
                     clean = pool[rs.choice(pool.shape[0], args.cd_points, replace=False)]
                     clean = _normalize_unit_sphere(clean.astype(np.float32))
                     noise_std = rs.uniform(args.noise_std_min, args.noise_std_max)
-                    noise = rs.laplace(0.0, noise_std / np.sqrt(2.0), size=clean.shape)
+                    # 与 starter code / 官方生成器一致：直接作为 laplace 尺度参数
+                    noise = rs.laplace(0.0, noise_std, size=clean.shape)
                     noisy = (clean + noise).astype(np.float32)
 
                     pred = model.predict_step({"pc_noisy": jt.array(noisy[None])})

@@ -6,9 +6,12 @@
 
 本项目针对拉普拉斯噪声做了三处适配：
 
-1. **噪声建模**(`src/data/augment.py` 的 `AugmentAddNoise`)：通过 `noise_type` 支持 `laplace`（默认）与 `gaussian`。配置中的 `noise_std_min/max` 统一表示噪声**标准差**；拉普拉斯采样时自动将标准差换算为尺度参数 `b = std / sqrt(2)`，保证训练噪声强度与测试集一致。
+1. **噪声建模**(`src/data/augment.py` 的 `AugmentAddNoise`)：通过 `noise_type` 支持 `laplace`（默认）与 `gaussian`。**拉普拉斯采样与官方 starter code 完全一致**——配置值直接作为 `np.random.laplace` 的尺度参数 b。不要擅自换算 `b = std/sqrt(2)`：官方测试集生成器与 starter code 同构，换算会导致训练噪声比测试噪声小 sqrt(2) 倍，本地指标好看但提交分数下降。
 2. **损失函数**(`src/model/vm.py`、`src/model/straightpcf.py`)：拉普拉斯噪声的最大似然估计对应 L1 损失，因此三个阶段（VM / CVM / DistanceModule）统一使用 Charbonnier（平滑 L1）损失 `sqrt(||d||^2 + eps)`，既对拉普拉斯重尾离群噪声鲁棒，又避免 L1 在零点不可导。
-3. **推理融合**(`src/model/vm.py` 的 `patch_based_denoise`)：每个点的最终位置由覆盖它的所有 patch 预测按 `exp(-dist)` 加权融合得到，替代原先"只取单个最佳 patch"的策略，可抑制离群 patch 预测；同时用 scatter 向量化实现，替代逐点 Python 循环，推理显著加速。
+3. **推理融合**(`src/model/vm.py` 的 `patch_based_denoise`)：通过模型配置的 `fusion_mode` 选择：
+   - `weighted`（默认）：每点由覆盖它的所有 patch 预测按 `exp(-dist)` 加权融合，抗离群预测，scatter 向量化实现；
+   - `best`：starter code 原版的单最佳 patch 策略（向量化重实现，语义一致），更保边缘，P2S 可能更好。
+   两种策略应在验证集上按 CD 实测后再决定提交用哪个。
 
 ## 竞赛提分工具
 

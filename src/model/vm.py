@@ -116,6 +116,7 @@ class VelocityModule(ModelSpec):
         # predict_rounds: 将上一轮输出重新当作输入迭代降噪，
         # 对拉普拉斯重尾残留的离群点有效；>1 时需验证细节不过度收缩
         num_steps = int(self.model_config.get('predict_rounds', 1))
+        fusion = self.model_config.get('fusion_mode', 'weighted')
         res = []
         for i, pc_noisy in enumerate(pc_noisy_batch):
             pc_next = pc_noisy
@@ -126,6 +127,7 @@ class VelocityModule(ModelSpec):
                     patch_size=1000,
                     seed_k=6,
                     seed_k_alpha=1,
+                    fusion=fusion,
                 )
                 if pc_out is None:
                     # patch 推理失败时回退上一步结果，保证输出完整
@@ -201,16 +203,18 @@ def knn_points(x, y, k):
     nn = jt.stack(nn, dim=0)
     return dist_k, idx, nn
 
-def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_k=6, seed_k_alpha=1) -> jt.Var:
+def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_k=6, seed_k_alpha=1, fusion='weighted') -> jt.Var:
     """
     pcl_noisy: (N, 3)
+    fusion: 'weighted' = 多 patch 加权平均（抗离群，但略有平滑收缩）；
+            'best'     = 原版 starter code 的单最佳 patch（保边缘，P2S 可能更好）
     """
     assert len(pcl_noisy.shape) == 2
-    
+
     N, d = pcl_noisy.shape
     num_patches = int(seed_k * N / patch_size)
     pcl_noisy = pcl_noisy.unsqueeze(0)  # (1, N, 3)
-    
+
     seed_pnts, seed_idx = farthest_point_sampling(pcl_noisy, num_patches)
     patch_dists, point_idxs, patches = knn_points(seed_pnts, pcl_noisy, patch_size)
 
@@ -241,9 +245,24 @@ def patch_based_denoise(model: VelocityModule, pcl_noisy, patch_size=1000, seed_
     patches_denoised = patches_denoised + seed_expand
     pcl_original = pcl_noisy.squeeze(0)
 
-    # 按 exp(-dist) 权重对所有覆盖该点的 patch 预测做加权融合，
-    # 而非只取单个最佳 patch：平均多个预测可抑制拉普拉斯重尾造成的离群估计，
-    # 同时用 scatter 向量化，替代逐点 Python 循环
+    if fusion == 'best':
+        # starter code 原版策略：每点只取权重最大（最近）patch 的预测。
+        # 按 patch 循环（P≈6N/1000，远小于原版的逐点 N 次循环）保持语义一致
+        best_w = jt.full((N,), -1e10)
+        best_pred = pcl_original.clone()
+        for p in range(num_patches):
+            idx_p = point_idxs[p]                    # (M,)
+            w_p = jt.exp(-patch_dists[p])            # (M,)
+            better = (w_p > best_w[idx_p]).unsqueeze(1)  # (M, 1)
+            best_w[idx_p] = jt.maximum(w_p, best_w[idx_p])
+            best_pred[idx_p] = jt.where(
+                better.broadcast((idx_p.shape[0], 3)),
+                patches_denoised[p],
+                best_pred[idx_p],
+            )
+        return best_pred
+
+    # 'weighted'：按 exp(-dist) 权重对所有覆盖该点的 patch 预测做加权融合
     flat_idx = point_idxs.reshape(-1)                                    # (P*M,)
     flat_w = jt.exp(-patch_dists).reshape(-1, 1)                         # (P*M, 1)
     flat_pred = patches_denoised.reshape(-1, 3) * flat_w                 # (P*M, 3)

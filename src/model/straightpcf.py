@@ -68,12 +68,14 @@ class _StraightPCFBase(ModelSpec):
         assert pc_noisy_batch.ndim == 3
         # predict_rounds: 多轮迭代降噪，将上一轮输出重新作为输入
         num_rounds = int(self.model_config.get("predict_rounds", 1))
+        fusion = self.model_config.get("fusion_mode", "weighted")
         results = []
         for pc_noisy in pc_noisy_batch:
             pc_current = pc_noisy
             for _ in range(num_rounds):
                 denoised = patch_based_denoise(
-                    self, pc_current, self.patch_size, self.seed_k, self.seed_k_alpha
+                    self, pc_current, self.patch_size, self.seed_k, self.seed_k_alpha,
+                    fusion=fusion,
                 )
                 if denoised is None:
                     # patch 推理失败时回退上一步结果，保证输出完整
