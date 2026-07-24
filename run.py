@@ -2,15 +2,13 @@ import jittor as jt
 jt.flags.use_cuda = 1
 
 from omegaconf import OmegaConf
-from tqdm import tqdm
-from typing import Dict, List
+from typing import Dict
 
 import argparse
 import numpy as np
 import os
 import random
 
-from src.data.asset import Asset, Exporter
 from src.data.dataset import DatasetConfig, DatasetConfig, PCDatasetModule
 from src.data.transform import Transform
 from src.model.parse import get_model
@@ -22,16 +20,6 @@ def load(task: str, path: str) -> Dict:
     path += '.yaml'
     print(f"\033[92mload {task} config: {path}\033[0m")
     return OmegaConf.to_container(OmegaConf.load(path)) # type: ignore
-
-def debug_fn(data: PCDatasetModule):
-    train_dataloader = data.train_dataloader()
-    assert train_dataloader is not None, "train_dataloader is None, cannot debug"
-    for batch in tqdm(train_dataloader):
-        batch: List[Asset]
-        # for asset in batch:
-        #     Exporter.export_obj(asset.sampled_vertices, "debug.obj")
-        #     Exporter.export_obj(asset.sampled_vertices_noisy, "debug_noisy.obj")
-        #     exit()
 
 if __name__ == "__main__":
         
@@ -47,7 +35,7 @@ if __name__ == "__main__":
     
     task = load('task', args.task)
     mode = task['mode']
-    assert mode in ['train', 'predict', 'debug', 'validate']
+    assert mode in ['train', 'predict', 'validate']
     components = task['components']
     
     # get train/validate/predict data
@@ -96,7 +84,6 @@ if __name__ == "__main__":
         train_transform=train_transform,
         validate_transform=validate_transform,
         predict_transform=predict_transform,
-        debug=task.get('debug', False),
     )
     
     optimizer_config = task.get('optimizer', None)
@@ -128,9 +115,7 @@ if __name__ == "__main__":
     else:
         system = None
     
-    if mode == 'debug':
-        debug_fn(data=dataset_module)
-    elif mode == 'train':
+    if mode == 'train':
         assert system is not None, "system is None, cannot train"
         system.train()
     elif mode == 'predict':

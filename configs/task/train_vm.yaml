@@ -1,5 +1,4 @@
 mode: train
-debug: False
 
 components:
   data: train

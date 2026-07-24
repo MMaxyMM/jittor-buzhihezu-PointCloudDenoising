@@ -1,3 +1,0 @@
-__target__: vm
-ckpt_save_dir: experiments/cvm_debug
-ckpt_save_name: checkpoint

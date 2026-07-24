@@ -6,9 +6,45 @@
 
 本项目针对拉普拉斯噪声做了三处适配：
 
-1. **噪声建模**(`src/data/augment.py` 的 `AugmentAddNoise`)：通过 `noise_type` 支持 `laplace`（默认）与 `gaussian`。配置中的 `noise_std_min/max` 统一表示噪声**标准差**；拉普拉斯采样时自动将标准差换算为尺度参数 `b = std / sqrt(2)`，保证训练噪声强度与测试集一致。
-2. **损失函数**(`src/model/vm.py` 的 `get_supervised_loss`)：拉普拉斯噪声的最大似然估计对应 L1 损失，因此将原 L2 损失替换为 Charbonnier（平滑 L1）损失 `sqrt(||d||^2 + eps)`，既对拉普拉斯重尾离群噪声鲁棒，又避免 L1 在零点不可导。
-3. **推理融合**(`src/model/vm.py` 的 `patch_based_denoise`)：每个点的最终位置由覆盖它的所有 patch 预测按 `exp(-dist)` 加权融合得到，替代原先"只取单个最佳 patch"的策略，可抑制离群 patch 预测；同时用 scatter 向量化实现，替代逐点 Python 循环，推理显著加速。
+1. **噪声建模**(`src/data/augment.py` 的 `AugmentAddNoise`)：通过 `noise_type` 支持 `laplace`（默认）与 `gaussian`。**拉普拉斯采样与官方 starter code 完全一致**——配置值直接作为 `np.random.laplace` 的尺度参数 b。不要擅自换算 `b = std/sqrt(2)`：官方测试集生成器与 starter code 同构，换算会导致训练噪声比测试噪声小 sqrt(2) 倍，本地指标好看但提交分数下降。
+2. **损失函数**(`src/model/vm.py`、`src/model/straightpcf.py`)：拉普拉斯噪声的最大似然估计对应 L1 损失，因此三个阶段（VM / CVM / DistanceModule）统一使用 Charbonnier（平滑 L1）损失 `sqrt(||d||^2 + eps)`，既对拉普拉斯重尾离群噪声鲁棒，又避免 L1 在零点不可导。
+3. **推理融合**(`src/model/vm.py` 的 `patch_based_denoise`)：通过模型配置的 `fusion_mode` 选择：
+   - `weighted`（默认）：每点由覆盖它的所有 patch 预测按 `exp(-dist)` 加权融合，抗离群预测，scatter 向量化实现；
+   - `best`：starter code 原版的单最佳 patch 策略（向量化重实现，语义一致），更保边缘，P2S 可能更好。
+   两种策略应在验证集上按 CD 实测后再决定提交用哪个。
+
+## 竞赛提分工具
+
+### 按 CD 选 checkpoint
+
+`select_best_checkpoint.py` 新增 `--metric cd`：在验证集上动态加噪、实际推理并计算 Chamfer Distance，与竞赛评分直接对齐（噪声种子固定，所有 checkpoint 输入一致）：
+
+```bash
+python select_best_checkpoint.py \
+  --ckpt_dir experiments/vm \
+  --task_template configs/task/train_vm_cached.yaml \
+  --metric cd --cd_limit 50 \
+  --output_dir checkpoint_selection_cd \
+  --copy_best
+```
+
+`--noise_std_min/max` 控制 CD 评估的加噪范围，默认与训练一致（0.005~0.020）。
+
+### 估计测试集噪声水平
+
+```bash
+python scripts/estimate_noise_level.py --input_dir dataset_test_noisy
+```
+
+通过局部 PCA 法向残差估计单轴噪声 std（中位数稳健、略偏大）。若测试噪声集中在某个固定值，建议把配置的 `noise_std_min/max` 收窄对准它。
+
+### 推理多轮迭代
+
+模型配置（如 `configs/model/vm.yaml`）新增可选项：
+
+```yaml
+predict_rounds: 2        # 多轮迭代降噪，默认 1；>1 需在验证集确认不过度收缩
+```
 
 ## 环境安装
 
@@ -206,12 +242,6 @@ ln -s /dev/shm/dataset_train_pcd dataset_train_pcd
 
 ## 使用缓存训练
 
-快速调试配置每个 epoch 使用 1000 个训练样本，batch size 保持 16：
-
-```bash
-python run.py --task configs/task/train_vm_cached_debug.yaml
-```
-
 正式缓存训练每个 epoch 使用 10000 个训练样本：
 
 ```bash
@@ -395,29 +425,6 @@ result.zip
 3. 加载训练完成的 CVM，冻结其参数，训练 DistanceModule 和最终位置损失。
 
 实现仍使用 Jittor，输入和输出点数完全相同。正式训练使用缓存 clean point cloud，但噪声、patch 和时间步仍在每次取样时动态生成。
-
-### 先运行小规模端到端验证
-
-下面两个命令各训练 1 epoch，使用 train_cached_debug 的 1000 个文件：
-
-~~~bash
-python run.py --task configs/task/train_cvm_cached_debug.yaml
-python run.py --task configs/task/train_straightpcf_cached_debug.yaml
-~~~
-
-第一个命令输出：
-
-~~~text
-experiments/cvm_debug/checkpoint_0.pkl
-~~~
-
-第二个命令通过 configs/model/straightpcf_debug.yaml 加载上述 CVM checkpoint，输出：
-
-~~~text
-experiments/straightpcf_debug/checkpoint_0.pkl
-~~~
-
-这两个 checkpoint 只用于验证代码链路，不应作为正式提交权重。
 
 ### 第一阶段：准备 VelocityModule 最优权重
 
