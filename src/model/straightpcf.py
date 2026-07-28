@@ -13,13 +13,17 @@ from .spec import ModelSpec
 from .vm import VelocityModule, patch_based_denoise
 
 
-def _charbonnier_vector_loss(diff, eps: float = 1e-12):
-    """Smooth L1-like loss for a 3D vector residual."""
+def _vector_loss(diff, loss_type: str, eps: float = 1e-12):
+    """3D 位移残差损失: 'charbonnier'(平滑 L1) | 'l2'。"""
+    if loss_type == "l2":
+        return (diff ** 2).sum(dim=-1).mean()
     return jt.sqrt((diff ** 2).sum(dim=-1) + eps).mean()
 
 
-def _charbonnier_scalar_loss(diff, eps: float = 1e-12):
-    """Smooth L1-like loss for a scalar residual."""
+def _scalar_loss(diff, loss_type: str, eps: float = 1e-12):
+    """标量残差损失: 'charbonnier'(平滑 L1) | 'l2'。"""
+    if loss_type == "l2":
+        return (diff ** 2).mean()
     return jt.sqrt(diff ** 2 + eps).mean()
 
 
@@ -61,6 +65,8 @@ class _StraightPCFBase(ModelSpec):
         self.patch_size = cfg.get("patch_size", 1000)
         self.seed_k = cfg.get("seed_k", 6)
         self.seed_k_alpha = cfg.get("seed_k_alpha", 1)
+        # loss_type: 'charbonnier'(默认) | 'l2'(收尾微调, 对齐 CD 指标)
+        self.loss_type = cfg.get("loss_type", "charbonnier")
 
     @jt.no_grad()
     def predict_step(self, batch: Dict) -> List[Dict]:
@@ -146,8 +152,8 @@ class CoupledVelocityModule(_StraightPCFBase):
             pred_dir = velocity_net.decoder(
                 c=feat.reshape(-1, feature_dim)
             ).reshape(batch_size, num_points, dims)
-            direction_loss = direction_loss + _charbonnier_vector_loss(
-                pred_dir - grad_target
+            direction_loss = direction_loss + _vector_loss(
+                pred_dir - grad_target, self.loss_type
             )
 
             pc_current = pc_current + ((1.0 - time) / self.num_modules) * pred_dir
@@ -162,8 +168,8 @@ class CoupledVelocityModule(_StraightPCFBase):
                     + (1.0 - next_step) * pc_noisy
                     - seed_points_t
                 )
-                consistency_loss = consistency_loss + _charbonnier_vector_loss(
-                    target - pc_current
+                consistency_loss = consistency_loss + _vector_loss(
+                    target - pc_current, self.loss_type
                 )
 
         return (
@@ -240,8 +246,8 @@ class StraightPCFModule(_StraightPCFBase):
         pc_clean = pc_clean - seed_points_t
         pc_current = pc_current - seed_points_t
         pred_distance = self._predict_distance(pc_current)
-        distance_loss = _charbonnier_scalar_loss(
-            pred_distance.reshape(batch_size) - distance_target
+        distance_loss = _scalar_loss(
+            pred_distance.reshape(batch_size) - distance_target, self.loss_type
         )
 
         for velocity_net in self.velocity_nets:
@@ -254,7 +260,7 @@ class StraightPCFModule(_StraightPCFBase):
                 ).reshape(batch_size, num_points, dims)
             pc_current = pc_current + pred_distance * pred_dir / self.num_modules
 
-        endpoint_loss = _charbonnier_vector_loss(pc_clean - pc_current)
+        endpoint_loss = _vector_loss(pc_clean - pc_current, self.loss_type)
         return (
             distance_loss + self.finetune_weight * endpoint_loss
         ) / self.dsm_sigma
