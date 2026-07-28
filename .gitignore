@@ -6,6 +6,7 @@ __pycache__/
 dataset_train/
 dataset_train_pcd/
 dataset_test_noisy/
+dataset_local_test/
 dataset_train.tar.gz
 dataset_test_noisy.zip
 
@@ -23,6 +24,15 @@ venv/
 .vscode/
 .DS_Store
 
-# Local Cursor skills (not shared)
+# Local evaluation, visualization and temporary artifacts
+scripts/train_l1_2_0_pipeline.sh
+scripts/test_selected_models.sh
+scripts/noise_level/
+tmp/
+diagnostics/
+visualizations/
+result.txt
+noise_level_report.json
+dataset_train_pcd_disk/
+dataset_train_psc_disk/
 .cursor/skills/
-

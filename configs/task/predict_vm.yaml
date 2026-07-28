@@ -1,5 +1,6 @@
 mode: predict
-load_ckpt: experiments/vm/checkpoint_95.pkl
+# load_ckpt: experiments/vm/checkpoint_95.pkl
+load_ckpt: checkpoint_selection_L1_2.0/best_checkpoint.pkl
 
 components:
   data: predict

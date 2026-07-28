@@ -1,5 +1,5 @@
 mode: predict
-load_ckpt: checkpoint_selection_straightpcf/best_checkpoint.pkl
+load_ckpt: checkpoint_selection_straightpcf_L1_2.0_1/best_checkpoint.pkl
 
 components:
   data: predict

@@ -7,8 +7,9 @@ distance_embedding_dim: 128
 decoder_hidden_dim: 64
 num_modules: 4
 total_iterations: 2
-finetune_weight: 200.0
-init_cvm_ckpt: checkpoint_selection_cvm/best_checkpoint.pkl
+finetune_weight: 1.0
+init_cvm_ckpt: checkpoint_selection_cvm_L1_2.0/best_checkpoint.pkl
 patch_size: 1000
 seed_k: 6
 seed_k_alpha: 1
+fusion_mode: best
