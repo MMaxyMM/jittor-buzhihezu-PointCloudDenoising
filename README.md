@@ -46,6 +46,65 @@ python scripts/estimate_noise_level.py --input_dir dataset_test_noisy
 predict_rounds: 2        # 多轮迭代降噪，默认 1；>1 需在验证集确认不过度收缩
 ```
 
+### 多 checkpoint 集成与 TTA
+
+`scripts/ensemble_predict.py` 对同一输入用多个 checkpoint 分别推理，可选旋转/缩放 TTA，逐点融合（median 抗离群，契合拉普拉斯噪声）：
+
+```bash
+python scripts/ensemble_predict.py \
+  --task configs/task/predict_vm.yaml \
+  --ckpts ckpt_a.pkl ckpt_b.pkl ckpt_c.pkl \
+  --tta 4 --fusion median \
+  --output_dir results_ensemble
+```
+
+- 所有 checkpoint 必须与 `--task` 的 model 配置同构；不同架构分两次运行再手动融合
+- `--tta 1` 关闭 TTA；视图 0 恒为恒等变换，随机种子固定可复现
+- 输出结构与 VMWriter 一致，打包方式相同
+- 建议先用 `--limit 2` 冒烟，再在验证集上确认集成优于单模型后再用于提交
+
+### cosine 学习率调度
+
+trainer 配置支持余弦衰减（`src/system/spec.py`），长训练时推荐开启：
+
+```yaml
+trainer:
+  epochs: 150
+  lr_decay: cosine       # 默认 none
+  lr_min_ratio: 0.01     # 最终 lr = 初始 lr × 0.01
+```
+
+### loss_type：Charbonnier 与 L2 切换
+
+模型配置（VM / CVM / StraightPCF 均支持）新增 `loss_type`：
+
+```yaml
+loss_type: charbonnier   # 默认，拉普拉斯噪声 MLE，主训练使用
+# loss_type: l2          # 仅用于收尾微调：从收敛 checkpoint 初始化、
+                         # lr 1e-5、5~10 epoch，对齐 CD 评测指标
+```
+
+L2 对拉普拉斯重尾敏感，**不要从头用 L2 训练**；微调结果需经本地 CD+P2S 验证确认增益后才保留。
+
+### 推荐的重训配置（扩容量基线）
+
+```yaml
+# configs/model/vm_large.yaml（新建，保留原 vm.yaml 做回退）
+feat_embedding_dim: 384      # 256 → 384
+
+# configs/transform/vm.yaml
+- __target__: patch
+  num_patches: 2             # 1 → 2，每样本多看两个 patch
+
+# configs/task/train_vm_cached.yaml
+trainer:
+  epochs: 150
+  lr_decay: cosine
+  lr_min_ratio: 0.01
+```
+
+验收标准：与当前最优模型在同一验证集、同一噪声种子下对比，总分提升 ≥0.5 且 CD/P2S 单项回退 ≤0.3 才替换；未达标则回退旧配置。
+
 ## 环境安装
 
 推荐使用 Python 3.9，并确保 GCC/G++ 版本不高于 10。

@@ -58,6 +58,9 @@ class DummySystem():
         if trainer_config is None:
             trainer_config = {}
         self.epochs = trainer_config.get('epochs', 1)
+        # lr_decay: 'none'(默认) | 'cosine'；cosine 从初始 lr 衰减到 lr_min_ratio 倍
+        self.lr_decay = trainer_config.get('lr_decay', 'none')
+        self.lr_min_ratio = trainer_config.get('lr_min_ratio', 0.01)
         
         if optimizer_config is not None and model is not None:
             self.optimizer = get_optimizer(optimizer_config, model)
@@ -147,7 +150,13 @@ class DummySystem():
     def train(self):
         assert self.optimizer is not None, "optimizer is None, cannot train"
         self.model.set_predict(False)
+        import math
+        base_lr = self.optimizer.lr
         for epoch in range(self.epochs):
+            if self.lr_decay == 'cosine':
+                progress = epoch / max(1, self.epochs - 1)
+                ratio = self.lr_min_ratio + (1 - self.lr_min_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+                self.optimizer.lr = base_lr * ratio
             self.model.train()
             self.on_train_epoch_start()
             train_dataloader = self.dataset_module.train_dataloader()

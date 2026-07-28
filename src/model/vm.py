@@ -26,6 +26,8 @@ class VelocityModule(ModelSpec):
         
         # score-matching
         self.dsm_sigma = cfg['dsm_sigma']
+        # loss_type: 'charbonnier'(默认, 拉普拉斯噪声 MLE, 抗重尾) | 'l2'(对齐 CD 指标, 用于收尾微调)
+        self.loss_type = cfg.get('loss_type', 'charbonnier')
         
         # networks
         self.encoder = FeatureExtraction(
@@ -68,10 +70,13 @@ class VelocityModule(ModelSpec):
             c=feat.reshape(-1, F_dim)
         ).reshape(B, len(pnt_idx), d) # type: ignore
 
-        # 拉普拉斯噪声的 MLE 对应 L1 损失；使用 Charbonnier（平滑 L1）
-        # 既保留对重尾离群噪声的鲁棒性，又避免 L1 在零点处不可导
         diff = pred_dir - grad_dir_t_target
-        loss = (jt.sqrt((diff ** 2.0).sum(dim=-1) + 1e-12) / self.dsm_sigma).mean()
+        if self.loss_type == 'l2':
+            loss = ((diff ** 2.0).sum(dim=-1) / self.dsm_sigma).mean()
+        else:
+            # 拉普拉斯噪声的 MLE 对应 L1 损失；Charbonnier（平滑 L1）
+            # 既保留对重尾离群噪声的鲁棒性，又避免 L1 在零点处不可导
+            loss = (jt.sqrt((diff ** 2.0).sum(dim=-1) + 1e-12) / self.dsm_sigma).mean()
 
         return loss
 
