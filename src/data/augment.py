@@ -41,8 +41,11 @@ class AugmentSample(Augment):
                 faces=asset.faces,
                 num_samples=self.num_samples,
                 num_vertex_samples=self.num_vertex_samples,
+                vertex_normals=asset.vertex_normals,
+                face_normals=asset.face_normals,
             )
             asset.sampled_vertices = sampled_vertices
+            asset.sampled_normals = sampled_normals
             return
 
         # Cached clean point clouds have already been sampled from the mesh.
@@ -54,21 +57,40 @@ class AugmentSample(Augment):
             raise ValueError(f"cached clean point cloud must have shape (N, 3), got {pc.shape}")
 
         cached_vertices = asset.cached_vertices
+        cached_vertex_normals = asset.cached_vertex_normals
+        surface_normals = asset.sampled_normals
         if cached_vertices is not None:
             num_vertices = min(
                 self.num_vertex_samples, self.num_samples, cached_vertices.shape[0]
             )
             vertex_indices = np.random.permutation(cached_vertices.shape[0])[:num_vertices]
             selected_vertices = cached_vertices[vertex_indices]
+            selected_normals = (
+                cached_vertex_normals[vertex_indices]
+                if cached_vertex_normals is not None else None
+            )
         else:
             num_vertices = 0
             selected_vertices = np.empty((0, 3), dtype=np.float32)
+            selected_normals = None
 
         num_surface = self.num_samples - num_vertices
         replace = pc.shape[0] < num_surface
         surface_indices = np.random.choice(pc.shape[0], size=num_surface, replace=replace)
         sampled = np.concatenate([selected_vertices, pc[surface_indices]], axis=0)
         asset.sampled_vertices = sampled.astype(np.float32, copy=False)
+        if surface_normals is not None and (
+            num_vertices == 0 or selected_normals is not None
+        ):
+            normal_parts = []
+            if selected_normals is not None:
+                normal_parts.append(selected_normals)
+            normal_parts.append(surface_normals[surface_indices])
+            asset.sampled_normals = np.concatenate(
+                normal_parts, axis=0
+            ).astype(np.float32, copy=False)
+        else:
+            asset.sampled_normals = None
 
 @dataclass(frozen=True)
 class AugmentNormalizePC(Augment):
@@ -173,6 +195,10 @@ class AugmentPatch(Augment):
     num_patches: int
     
     train_cvm_network: bool
+
+    # VM keeps the original interpolated center. Diffusion refiners use
+    # noisy_seed so training coordinates match FPS-centered inference patches.
+    center_mode: str="interpolated"
     
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentPatch':
@@ -196,6 +222,10 @@ class AugmentPatch(Augment):
 
         pat_A = pc_noisy[nn_idx].astype(np.float32, copy=False)  # (P, M, 3)
         pat_B = pc[nn_idx].astype(np.float32, copy=False)        # (P, M, 3)
+        clean_normals = (
+            asset.sampled_normals[nn_idx].astype(np.float32, copy=False)
+            if asset.sampled_normals is not None else None
+        )
         noise_std = np.float32(
             asset.meta.get("noise_std", 0.0) if asset.meta is not None else 0.0
         )
@@ -223,10 +253,17 @@ class AugmentPatch(Augment):
         t = (l2 - l1) * t + l1
         
         pat_t = t * pat_B + (1 - t) * pat_A
-        seed_points_t = (
-            t[:, 0:1, :] * pc[seed_idx][:, None, :] +
-            (1 - t[:, 0:1, :]) * pc_noisy[seed_idx][:, None, :]
-        )
+        if self.center_mode == "interpolated":
+            seed_points_t = (
+                t[:, 0:1, :] * pc[seed_idx][:, None, :]
+                + (1 - t[:, 0:1, :]) * pc_noisy[seed_idx][:, None, :]
+            )
+        elif self.center_mode == "noisy_seed":
+            seed_points_t = pc_noisy[seed_idx][:, None, :]
+        elif self.center_mode == "clean_seed":
+            seed_points_t = pc[seed_idx][:, None, :]
+        else:
+            raise ValueError(f"unsupported patch center_mode: {self.center_mode}")
         
         pat_A = pat_A - seed_points_t
         pat_B = pat_B - seed_points_t
@@ -237,6 +274,8 @@ class AugmentPatch(Augment):
         asset.meta['pc_noisy'] = pat_A
         asset.meta['pc_clean'] = pat_B
         asset.meta['pc_mix'] = pat_t
+        if clean_normals is not None:
+            asset.meta['clean_normals'] = clean_normals
         asset.meta['noise_std'] = np.full(
             (self.num_patches, 1), noise_std, dtype=np.float32
         )

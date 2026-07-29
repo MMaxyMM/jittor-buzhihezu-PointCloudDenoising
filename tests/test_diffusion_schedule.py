@@ -22,7 +22,7 @@ class DiffusionScheduleTest(unittest.TestCase):
         self.assertTrue(np.all(np.diff(schedule.alphas_np) <= 1e-7))
         self.assertTrue(np.all(np.diff(schedule.sigmas_np) >= -1e-7))
         indices = schedule.inference_indices(4)
-        self.assertEqual(int(indices[0]), 100)
+        self.assertEqual(int(indices[0]), 99)
         self.assertEqual(int(indices[-1]), 0)
 
     def test_v_parameterization_round_trip(self):
@@ -41,6 +41,12 @@ class DiffusionScheduleTest(unittest.TestCase):
         np.testing.assert_allclose(
             recovered_noise.numpy(), noise.numpy(), atol=1e-5
         )
+
+    def test_device_timestep_lookup(self):
+        schedule = CosineSchedule(num_train_steps=20)
+        alpha, sigma = schedule.coefficients(jt.array([1, 19]).int32())
+        self.assertEqual(alpha.shape, [2, 1, 1])
+        self.assertEqual(sigma.shape, [2, 1, 1])
 
 
 if __name__ == "__main__":

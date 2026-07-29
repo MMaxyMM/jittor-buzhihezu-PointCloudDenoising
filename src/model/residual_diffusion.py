@@ -147,6 +147,8 @@ def estimate_noise_std(points: np.ndarray, k: int = 16, max_points: int = 8192):
 class ResidualDiffusionModule(ModelSpec):
     """Observation-conditioned diffusion over normalized clean-minus-noisy residuals."""
 
+    accepts_point_ids = True
+
     def __init__(self, model_config, transform_config):
         super().__init__(model_config, transform_config)
         cfg = self.model_config
@@ -154,7 +156,10 @@ class ResidualDiffusionModule(ModelSpec):
         self.num_train_points = int(cfg.get("num_train_points", 128))
         self.patch_size = int(cfg.get("patch_size", 1000))
         self.seed_k = int(cfg.get("seed_k", 6))
-        self.seed_k_alpha = int(cfg.get("seed_k_alpha", 1))
+        self.seed_k_alpha = float(cfg.get("seed_k_alpha", 1))
+        self.inference_patch_batch_size = cfg.get("inference_patch_batch_size")
+        if self.inference_patch_batch_size is not None:
+            self.inference_patch_batch_size = int(self.inference_patch_batch_size)
         self.num_inference_steps = int(cfg.get("num_inference_steps", 4))
         self.predict_rounds = int(cfg.get("predict_rounds", 1))
         self.sampling_seed = int(cfg.get("sampling_seed", 123))
@@ -272,14 +277,12 @@ class ResidualDiffusionModule(ModelSpec):
 
         timestep = np.random.randint(
             1,
-            self.schedule.num_train_steps + 1,
+            self.schedule.num_train_steps,
             size=(batch_size,),
             dtype=np.int64,
         )
         alpha, sigma = self.schedule.coefficients(timestep)
-        noise = jt.array(
-            np.random.normal(size=normalized_clean.shape).astype(np.float32)
-        )
+        noise = jt.randn(normalized_clean.shape)
         state = q_sample(normalized_clean, noise, alpha, sigma)
         prediction = self._network(
             state, pc_noisy, timestep, observation_std
@@ -352,7 +355,9 @@ class ResidualDiffusionModule(ModelSpec):
         return self.training_step(**kwargs)
 
     @jt.no_grad()
-    def denoise_langevin_dynamics(self, pcl_noisy, num_steps=None):
+    def denoise_langevin_dynamics(
+        self, pcl_noisy, num_steps=None, point_ids=None
+    ):
         batch_size = pcl_noisy.shape[0]
         observation_std = jt.ones((batch_size, 1, 1)) * float(
             self._current_inference_std
@@ -374,6 +379,7 @@ class ResidualDiffusionModule(ModelSpec):
                     if num_steps is None else int(num_steps)
                 ),
                 seed=self.sampling_seed,
+                point_ids=point_ids,
                 clip_normalized_residual=self.clip_normalized_residual,
             )
         denoised = pcl_noisy + normalized_residual * observation_std
@@ -411,6 +417,7 @@ class ResidualDiffusionModule(ModelSpec):
                         1 if self.objective == "direct"
                         else self.num_inference_steps
                     ),
+                    patch_batch_size=self.inference_patch_batch_size,
                 )
                 if denoised is None:
                     break

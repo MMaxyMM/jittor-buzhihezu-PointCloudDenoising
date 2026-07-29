@@ -34,6 +34,8 @@ class ObjLazyAsset(LazyAsset):
             cls=self.cls,
             vertices=np.array(mesh.vertices), # type: ignore
             faces=np.array(mesh.faces), # type: ignore
+            vertex_normals=np.array(mesh.vertex_normals, dtype=np.float32),
+            face_normals=np.array(mesh.face_normals, dtype=np.float32),
         )
         return asset
 
@@ -59,7 +61,13 @@ class CleanNpyLazyAsset(LazyAsset):
         if not np.isfinite(pc).all():
             raise ValueError(f"clean point cloud contains non-finite values: {self.path}")
         vertices_path = os.path.join(os.path.dirname(self.path), "vertices.npy")
+        normals_path = os.path.join(os.path.dirname(self.path), "normals.npy")
+        vertex_normals_path = os.path.join(
+            os.path.dirname(self.path), "vertex_normals.npy"
+        )
         cached_vertices = None
+        sampled_normals = None
+        cached_vertex_normals = None
         if os.path.isfile(vertices_path):
             cached_vertices = np.load(vertices_path)
             if cached_vertices.ndim != 2 or cached_vertices.shape[1] != 3:
@@ -72,12 +80,39 @@ class CleanNpyLazyAsset(LazyAsset):
                     f"cached OBJ vertices contain non-finite values: {vertices_path}"
                 )
             cached_vertices = cached_vertices.astype(np.float32, copy=False)
+        if os.path.isfile(normals_path):
+            sampled_normals = np.load(normals_path)
+            if sampled_normals.shape != pc.shape or not np.isfinite(sampled_normals).all():
+                raise ValueError(
+                    f"cached normals must match clean points {pc.shape}, got "
+                    f"{sampled_normals.shape}: {normals_path}"
+                )
+            sampled_normals = sampled_normals.astype(np.float32, copy=False)
+        if os.path.isfile(vertex_normals_path):
+            cached_vertex_normals = np.load(vertex_normals_path)
+            expected_shape = (
+                None if cached_vertices is None else cached_vertices.shape
+            )
+            if (
+                expected_shape is None
+                or cached_vertex_normals.shape != expected_shape
+                or not np.isfinite(cached_vertex_normals).all()
+            ):
+                raise ValueError(
+                    "cached vertex normals must match vertices.npy: "
+                    f"{vertex_normals_path}"
+                )
+            cached_vertex_normals = cached_vertex_normals.astype(
+                np.float32, copy=False
+            )
 
         asset = Asset(
             path=self.path,
             cls=self.cls,
             sampled_vertices=pc.astype(np.float32, copy=False),
+            sampled_normals=sampled_normals,
             cached_vertices=cached_vertices,
+            cached_vertex_normals=cached_vertex_normals,
         )
         return asset
 

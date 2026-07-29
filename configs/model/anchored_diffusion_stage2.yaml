@@ -1,0 +1,57 @@
+__target__: AnchoredResidualDiffusionModule
+
+anchor_ckpt: experiments/direct_residual/best_checkpoint.pkl
+anchor_model:
+  backbone: dgcnn
+  frame_knn: 16
+  num_train_points: 128
+  feat_embedding_dim: 256
+  decoder_hidden_dim: 64
+  condition_embedding_dim: 64
+  objective: direct
+  prediction_type: v
+  num_train_steps: 1000
+  num_inference_steps: 1
+  condition_on_time: false
+  condition_on_observation_std: true
+  noise_std_min: 0.005
+  noise_std_max: 0.020
+  inference_noise_mode: fixed
+  inference_noise_std: 0.0125
+
+backbone: point_transformer
+transformer_blocks: 4
+frame_knn: 24
+feat_embedding_dim: 192
+decoder_hidden_dim: 96
+condition_embedding_dim: 64
+
+num_train_steps: 1000
+cosine_s: 0.008
+# Faster default inference: 4 DDIM steps is usually enough for this refiner.
+num_inference_steps: 4
+self_condition_probability: 0.5
+min_snr_gamma: 5.0
+lambda_smooth_l1: 0.5
+smooth_l1_beta: 0.25
+lambda_cd: 0.02
+lambda_point_to_plane: 0.15
+cd_num_points: 256
+
+noise_std_min: 0.005
+noise_std_max: 0.020
+inference_noise_mode: fixed
+inference_noise_std: 0.0125
+clip_normalized_residual: 3.0
+
+patch_size: 1000
+# Fewer overlapping patches → fewer FPS/KNN/network calls.
+seed_k: 4
+seed_k_alpha: 1
+# How many patches are denoised in one GPU forward. Raise if VRAM allows.
+inference_patch_batch_size: 64
+predict_rounds: 1
+sampling_seed: 123
+blend_beta: 0.75
+use_variance_gate: true
+variance_gate_scale: 0.25

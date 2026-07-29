@@ -7,16 +7,25 @@ from .feature import get_knn_idx
 
 
 def _gather_neighbors(values, indices):
-    return jt.stack(
-        [values[batch_idx][indices[batch_idx]]
-         for batch_idx in range(values.shape[0])],
-        dim=0,
-    )
+    """Vectorized batched gather: (B,N,C), (B,N,K) -> (B,N,K,C)."""
+    batch_size, num_points, channels = values.shape
+    num_neighbors = indices.shape[-1]
+    base = (jt.arange(batch_size) * num_points).reshape(batch_size, 1, 1)
+    flat_indices = (indices + base).reshape(-1)
+    return values.reshape(batch_size * num_points, channels)[
+        flat_indices
+    ].reshape(batch_size, num_points, num_neighbors, channels)
 
 
 class LocalPointTransformerBlock(nn.Module):
-    def __init__(self, channels: int, condition_dim: int):
+    def __init__(
+        self,
+        channels: int,
+        condition_dim: int,
+        expansion: int = 2,
+    ):
         super().__init__()
+        self.norm1 = nn.LayerNorm(channels)
         self.query = nn.Linear(channels, channels)
         self.key = nn.Linear(channels, channels)
         self.value = nn.Linear(channels, channels)
@@ -32,11 +41,17 @@ class LocalPointTransformerBlock(nn.Module):
         )
         self.output = nn.Linear(channels, channels)
         self.film = nn.Linear(condition_dim, channels * 2)
-        self.activation = nn.ReLU()
+        self.norm2 = nn.LayerNorm(channels)
+        self.ffn = nn.Sequential(
+            nn.Linear(channels, channels * expansion),
+            nn.ReLU(),
+            nn.Linear(channels * expansion, channels),
+        )
 
     def execute(self, features, geometry, neighbor_indices, condition):
         batch_size, num_points, channels = features.shape
-        neighbors = _gather_neighbors(features, neighbor_indices)
+        normalized = self.norm1(features)
+        neighbors = _gather_neighbors(normalized, neighbor_indices)
         neighbor_geometry = _gather_neighbors(geometry, neighbor_indices)
         relative_position = (
             geometry.unsqueeze(2) - neighbor_geometry
@@ -47,7 +62,7 @@ class LocalPointTransformerBlock(nn.Module):
             batch_size, num_points, neighbor_indices.shape[-1], channels
         )
 
-        query = self.query(features.reshape(-1, channels)).reshape(
+        query = self.query(normalized.reshape(-1, channels)).reshape(
             batch_size, num_points, 1, channels
         )
         key = self.key(neighbors.reshape(-1, channels)).reshape(
@@ -70,9 +85,11 @@ class LocalPointTransformerBlock(nn.Module):
         film = self.film(condition)
         gamma = film[:, :channels].reshape(batch_size, 1, channels)
         beta = film[:, channels:].reshape(batch_size, 1, channels)
-        return self.activation(
-            features + output * (1.0 + gamma) + beta
-        )
+        features = features + output * (1.0 + gamma) + beta
+        feed_forward = self.ffn(
+            self.norm2(features).reshape(-1, channels)
+        ).reshape(batch_size, num_points, channels)
+        return features + feed_forward
 
 
 class LocalPointTransformerEncoder(nn.Module):
@@ -85,6 +102,7 @@ class LocalPointTransformerEncoder(nn.Module):
         condition_dim: int,
         input_dim: int = 6,
         num_blocks: int = 3,
+        expansion: int = 2,
     ):
         super().__init__()
         self.k = k
@@ -96,7 +114,7 @@ class LocalPointTransformerEncoder(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 LocalPointTransformerBlock(
-                    embedding_dim, condition_dim
+                    embedding_dim, condition_dim, expansion=expansion
                 )
                 for _ in range(num_blocks)
             ]

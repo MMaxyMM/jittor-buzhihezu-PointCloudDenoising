@@ -445,6 +445,40 @@ python evaluate.py \
 
 ---
 
+## Direct-Anchor Point Transformer Diffusion
+
+该终极实验冻结 Direct DGCNN（`experiments/direct_residual/best_checkpoint.pkl`），
+只扩散建模锚点剩余误差。正式训练前需补建与 `clean.npy` 一一对应的 normals。
+
+```bash
+# 1) 为已有 clean cache 补建 surface/vertex normals（可续跑，已生成会跳过）
+python scripts/precompute_clean_points.py \
+    --input_dir dataset_train --output_dir dataset_train_pcd --workers 16
+
+# 2) Stage 1（60 epochs；DataLoader workers=2，适配约 16GB 主机内存）
+python run.py --task configs/task/train_anchored_diffusion_stage1.yaml
+
+# 3) 筛选后期 Stage 1 EMA checkpoint（50-cloud 官方分面板）
+python select_best_checkpoint.py \
+    --metric official \
+    --ckpt_dir experiments/anchored_diffusion_stage1 \
+    --task_template configs/task/train_anchored_diffusion_stage1.yaml \
+    --output_dir checkpoint_selection_anchored_diffusion_stage1 \
+    --mesh_root dataset_train --cd_limit 50 \
+    --start_epoch 50 --copy_best
+
+# 4) Stage 2（30 epochs，从 Stage 1 最佳 EMA 初始化）
+python run.py --task configs/task/train_anchored_diffusion_stage2.yaml
+
+# 5) 推理超参扫描（将 checkpoint_XX 换成 Stage 2 最优）
+python scripts/sweep_anchored_inference.py \
+    --checkpoint experiments/anchored_diffusion_stage2/checkpoint_29.pkl
+```
+
+若最终官方 CD+P2S 联合分未超过 Direct DGCNN，`beta=0` 路径会回退到冻结锚点。
+
+---
+
 
 
 ## 9. 注意事项

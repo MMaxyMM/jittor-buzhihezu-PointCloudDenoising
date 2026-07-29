@@ -1,0 +1,13 @@
+mode: predict
+load_ckpt: checkpoint_selection_anchored_diffusion_stage2/best_checkpoint.pkl
+
+components:
+  data: predict
+  transform: predict
+  system: anchored_diffusion_stage2
+  model: anchored_diffusion_stage2
+
+writer:
+  __target__: vm
+  save_dir: results_anchored_diffusion
+  save_name: denoised

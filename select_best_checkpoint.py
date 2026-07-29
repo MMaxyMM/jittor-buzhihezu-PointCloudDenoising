@@ -22,6 +22,7 @@ import json
 import random
 import re
 import shutil
+import subprocess
 import time
 import traceback
 from copy import deepcopy
@@ -38,6 +39,8 @@ MODEL_TARGET_FALLBACK = {
     "vm": "VelocityModule",
     "residual_diffusion": "ResidualDiffusionModule",
     "direct_residual": "ResidualDiffusionModule",
+    "anchored_diffusion_stage1": "AnchoredResidualDiffusionModule",
+    "anchored_diffusion_stage2": "AnchoredResidualDiffusionModule",
 }
 
 
@@ -48,6 +51,8 @@ class CheckpointResult:
     score: Optional[float]
     status: str
     error: str = ""
+    direction: str = "lower"
+    metrics: Optional[Dict[str, float]] = None
 
 
 def checkpoint_epoch(path: Path) -> Optional[int]:
@@ -136,7 +141,13 @@ def write_results(results: Iterable[CheckpointResult], output_dir: Path) -> None
 
     csv_path = output_dir / "checkpoint_ranking.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["checkpoint", "epoch", "score", "status", "error"])
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "checkpoint", "epoch", "score", "status", "error",
+                "direction", "metrics",
+            ],
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -318,69 +329,213 @@ def _normalize_unit_sphere(pc):
     return pc / scale
 
 
-def evaluate_checkpoint_cd(ckpt_path: Path, context: Dict, log_path: Path, args) -> Tuple[Optional[float], Dict[str, float]]:
+def _mesh_path_for_cached_asset(asset_path: str, mesh_root: str) -> Path:
+    path = Path(asset_path)
+    parts = path.parts
+    try:
+        shapenet_index = parts.index("shapenet")
+    except ValueError as exc:
+        raise ValueError(
+            f"cannot derive ShapeNet relative path from {asset_path}"
+        ) from exc
+    relative_dir = Path(*parts[shapenet_index:]).parent
+    return Path(mesh_root) / relative_dir / "models" / "model_normalized.obj"
+
+
+def _gpu_memory_used_mib() -> Optional[float]:
+    try:
+        output = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-compute-apps=used_memory",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+            timeout=2,
+        )
+        values = [float(line.strip()) for line in output.splitlines() if line.strip()]
+        return max(values) if values else 0.0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def build_cd_eval_panel(context: Dict, args) -> List[Dict]:
+    """Materialize the fixed noisy/clean(/mesh) panel once for all checkpoints."""
+    from evaluate import load_mesh_vf
+
+    panel: List[Dict] = []
+    sample_index = 0
+    for _, ds_config in context["validate_dataset_config"].items():
+        for lazy_asset in ds_config.datapath.get_data():
+            if args.cd_limit is not None and sample_index >= args.cd_limit:
+                return panel
+            asset = lazy_asset.load()
+            pool = asset.sampled_vertices
+            if pool is None or pool.shape[0] < args.cd_points:
+                continue
+
+            rs = np.random.RandomState(context["seed"] + sample_index)
+            clean_raw = pool[
+                rs.choice(pool.shape[0], args.cd_points, replace=False)
+            ].astype(np.float32)
+            center = (clean_raw.max(axis=0) + clean_raw.min(axis=0)) / 2
+            centered = clean_raw - center
+            scale = float(np.sqrt((centered ** 2).sum(axis=1)).max())
+            clean = (centered / scale).astype(np.float32)
+            noise_std = rs.uniform(args.noise_std_min, args.noise_std_max)
+            noise = rs.laplace(0.0, noise_std / np.sqrt(2.0), size=clean.shape)
+            noisy = (clean + noise).astype(np.float32)
+
+            sample = {
+                "index": sample_index,
+                "path": asset.path,
+                "clean": clean,
+                "noisy": noisy,
+                "center": center,
+                "scale": scale,
+            }
+            if args.metric == "official":
+                mesh_path = _mesh_path_for_cached_asset(asset.path, args.mesh_root)
+                mesh_vertices, mesh_faces = load_mesh_vf(str(mesh_path))
+                if mesh_vertices is None:
+                    raise FileNotFoundError(
+                        f"validation mesh is unavailable: {mesh_path}"
+                    )
+                sample["mesh_vertices"] = (
+                    (mesh_vertices - center) / scale
+                ).astype(np.float64, copy=False)
+                sample["mesh_faces"] = mesh_faces
+            panel.append(sample)
+            sample_index += 1
+    return panel
+
+
+def evaluate_checkpoint_cd(
+    ckpt_path: Path,
+    context: Dict,
+    log_path: Path,
+    args,
+    model=None,
+) -> Tuple[Optional[float], Dict[str, float]]:
     """在验证集上直接计算 Chamfer Distance：动态加噪 → 模型推理 → 对比 clean GT。
 
     与 loss 模式不同，该指标与竞赛评分直接对齐。噪声按固定种子生成，
     所有 checkpoint 面对完全相同的含噪输入，排名可比。
     """
     import jittor as jt
-    import numpy as np
 
     from src.model.parse import get_model
 
-    np.random.seed(context["seed"])
-    random.seed(context["seed"])
+    panel = context.get("cd_panel")
+    if panel is None:
+        panel = build_cd_eval_panel(context, args)
+        context["cd_panel"] = panel
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
         with contextlib.redirect_stdout(log_file), contextlib.redirect_stderr(log_file):
-            model = get_model(
-                model_config=deepcopy(context["model_config"]),
-                transform_config=deepcopy(context["transform_config"]),
-            )
+            if model is None:
+                model = get_model(
+                    model_config=deepcopy(context["model_config"]),
+                    transform_config=deepcopy(context["transform_config"]),
+                )
             model.load(str(ckpt_path))
             model.set_predict(True)
             model.eval()
+            if getattr(args, "patch_batch_size", None) is not None:
+                model.inference_patch_batch_size = int(args.patch_batch_size)
 
             cds: List[float] = []
             noisy_cds: List[float] = []
             cd_scores: List[float] = []
+            p2s_values: List[float] = []
+            noisy_p2s_values: List[float] = []
+            p2s_scores: List[float] = []
             inference_seconds: List[float] = []
             displacement_p95: List[float] = []
-            sample_index = 0
-            for cls, ds_config in context["validate_dataset_config"].items():
-                for lazy_asset in ds_config.datapath.get_data():
-                    if args.cd_limit is not None and sample_index >= args.cd_limit:
-                        break
-                    asset = lazy_asset.load()
-                    pool = asset.sampled_vertices
-                    if pool is None or pool.shape[0] < args.cd_points:
-                        continue
+            correction_p95: List[float] = []
+            anchor_refiner_p95: List[float] = []
+            per_sample = []
 
-                    rs = np.random.RandomState(context["seed"] + sample_index)
-                    clean = pool[rs.choice(pool.shape[0], args.cd_points, replace=False)]
-                    clean = _normalize_unit_sphere(clean.astype(np.float32))
-                    noise_std = rs.uniform(args.noise_std_min, args.noise_std_max)
-                    noise = rs.laplace(0.0, noise_std / np.sqrt(2.0), size=clean.shape)
-                    noisy = (clean + noise).astype(np.float32)
+            for sample in panel:
+                noisy = sample["noisy"]
+                clean = sample["clean"]
 
-                    started_at = time.perf_counter()
-                    pred = model.predict_step({"pc_noisy": jt.array(noisy[None])})
-                    denoised = pred[0]["pc_denoised"]
-                    inference_seconds.append(time.perf_counter() - started_at)
-                    cd = _chamfer_distance(denoised, clean)
-                    cd_noisy = _chamfer_distance(noisy, clean)
-                    cds.append(cd)
-                    noisy_cds.append(cd_noisy)
-                    cd_scores.append(
-                        float(np.clip(100.0 * (1.0 - cd / cd_noisy), 0.0, 100.0))
+                started_at = time.perf_counter()
+                pred = model.predict_step({"pc_noisy": jt.array(noisy[None])})
+                denoised = pred[0]["pc_denoised"]
+                inference_seconds.append(time.perf_counter() - started_at)
+                cd = _chamfer_distance(denoised, clean)
+                cd_noisy = _chamfer_distance(noisy, clean)
+                cds.append(cd)
+                noisy_cds.append(cd_noisy)
+                cd_scores.append(
+                    float(np.clip(100.0 * (1.0 - cd / cd_noisy), 0.0, 100.0))
+                )
+                displacement_p95.append(
+                    float(np.percentile(np.linalg.norm(denoised - noisy, axis=1), 95))
+                )
+                diagnostic = getattr(model, "_last_patch_diagnostics", {})
+                correction_value = None
+                if "normalized_correction" in diagnostic:
+                    normalized_correction = diagnostic[
+                        "normalized_correction"
+                    ].detach().numpy()
+                    correction_value = float(np.percentile(
+                        np.linalg.norm(
+                            normalized_correction
+                            * float(model._current_inference_std),
+                            axis=1,
+                        ),
+                        95,
+                    ))
+                    correction_p95.append(correction_value)
+                anchor_refiner_value = None
+                if "fused_anchor" in diagnostic:
+                    fused_anchor = diagnostic["fused_anchor"].detach().numpy()
+                    anchor_refiner_value = float(np.percentile(
+                        np.linalg.norm(denoised - fused_anchor, axis=1), 95
+                    ))
+                    anchor_refiner_p95.append(anchor_refiner_value)
+
+                p2s = noisy_p2s = p2s_score = None
+                if args.metric == "official":
+                    from evaluate import point_to_surface_distance
+
+                    p2s = point_to_surface_distance(
+                        denoised, sample["mesh_vertices"], sample["mesh_faces"]
                     )
-                    displacement_p95.append(
-                        float(np.percentile(np.linalg.norm(denoised - noisy, axis=1), 95))
+                    noisy_p2s = point_to_surface_distance(
+                        noisy, sample["mesh_vertices"], sample["mesh_faces"]
                     )
-                    print(f"sample {sample_index} ({asset.path}): cd={cd:.8f} cd_noisy={cd_noisy:.8f} improve={100*(1-cd/cd_noisy):.2f}")
-                    sample_index += 1
+                    p2s_score = float(np.clip(
+                        100.0 * (1.0 - p2s / noisy_p2s),
+                        0.0,
+                        100.0,
+                    ))
+                    p2s_values.append(p2s)
+                    noisy_p2s_values.append(noisy_p2s)
+                    p2s_scores.append(p2s_score)
+                per_sample.append({
+                    "index": sample["index"],
+                    "path": sample["path"],
+                    "cd": cd,
+                    "noisy_cd": cd_noisy,
+                    "cd_score": cd_scores[-1],
+                    "p2s": p2s,
+                    "noisy_p2s": noisy_p2s,
+                    "p2s_score": p2s_score,
+                    "displacement_p95": displacement_p95[-1],
+                    "correction_p95": correction_value,
+                    "anchor_refiner_p95": anchor_refiner_value,
+                    "inference_seconds": inference_seconds[-1],
+                })
+                print(
+                    f"sample {sample['index']} ({sample['path']}): "
+                    f"cd={cd:.8f} cd_noisy={cd_noisy:.8f} "
+                    f"cd_score={cd_scores[-1]:.2f} "
+                    f"p2s_score={p2s_score}"
+                )
 
             mean_cd = mean(cds)
             metrics = {"val/cd_mean": mean_cd} if mean_cd is not None else {}
@@ -390,27 +545,71 @@ def evaluate_checkpoint_cd(ckpt_path: Path, context: Dict, log_path: Path, args)
                     "val/cd_score_mean": mean(cd_scores),
                     "val/inference_seconds_mean": mean(inference_seconds),
                     "val/displacement_p95_mean": mean(displacement_p95),
+                    "val/correction_p95_mean": mean(correction_p95),
+                    "val/anchor_refiner_p95_mean": mean(anchor_refiner_p95),
+                    "val/gpu_memory_used_mib_max": _gpu_memory_used_mib(),
                     "model/parameters": float(
                         sum(int(np.prod(parameter.shape)) for parameter in model.parameters())
                     ),
+                    "eval/patch_batch_size": float(
+                        getattr(model, "inference_patch_batch_size", 0) or 0
+                    ),
                 })
+            if p2s_scores:
+                metrics.update({
+                    "val/p2s_mean": mean(p2s_values),
+                    "val/noisy_p2s_mean": mean(noisy_p2s_values),
+                    "val/p2s_score_mean": mean(p2s_scores),
+                    "val/final_score": 0.5 * mean(cd_scores)
+                    + 0.5 * mean(p2s_scores),
+                })
+            per_sample_path = (
+                log_path.parent.parent
+                / "per_sample"
+                / f"{ckpt_path.stem}_{args.metric}.json"
+            )
+            per_sample_path.parent.mkdir(parents=True, exist_ok=True)
+            with per_sample_path.open("w", encoding="utf-8") as sample_file:
+                json.dump(per_sample, sample_file, indent=2, ensure_ascii=False)
             print(json.dumps(metrics, indent=2, ensure_ascii=False))
             if hasattr(jt, "gc"):
                 jt.gc()
 
+    if args.metric == "official":
+        return metrics.get("val/final_score"), metrics
     return metrics.get("val/cd_mean"), metrics
 
 
 def rank_results(results: List[CheckpointResult]) -> List[CheckpointResult]:
     ok = [item for item in results if item.status == "ok" and item.score is not None]
     bad = [item for item in results if item.status != "ok" or item.score is None]
-    return sorted(ok, key=lambda item: item.score) + bad
+    return sorted(
+        ok,
+        key=lambda item: (
+            -item.score if item.direction == "higher" else item.score
+        ),
+    ) + bad
 
 
 def run_selection(args, checkpoints: List[Path], existing: Dict[str, CheckpointResult]) -> List[CheckpointResult]:
     output_dir = Path(args.output_dir)
     context = build_validation_context(args)
     results: List[CheckpointResult] = []
+    shared_model = None
+
+    if args.metric in ("cd", "official"):
+        print(f"Building fixed {args.metric} panel...")
+        context["cd_panel"] = build_cd_eval_panel(context, args)
+        print(f"  panel size: {len(context['cd_panel'])}")
+        from src.model.parse import get_model
+
+        shared_model = get_model(
+            model_config=deepcopy(context["model_config"]),
+            transform_config=deepcopy(context["transform_config"]),
+        )
+        if args.patch_batch_size is not None:
+            shared_model.inference_patch_batch_size = int(args.patch_batch_size)
+            print(f"  inference patch_batch_size: {args.patch_batch_size}")
 
     for index, ckpt in enumerate(checkpoints, start=1):
         ckpt_abs = ckpt.resolve()
@@ -426,10 +625,14 @@ def run_selection(args, checkpoints: List[Path], existing: Dict[str, CheckpointR
 
         print(f"[{index}/{len(checkpoints)}] validate {args.metric}: {ckpt}")
         try:
-            if args.metric == "cd":
-                score, _ = evaluate_checkpoint_cd(ckpt_abs, context, log_path, args)
+            if args.metric in ("cd", "official"):
+                score, metrics = evaluate_checkpoint_cd(
+                    ckpt_abs, context, log_path, args, model=shared_model
+                )
             else:
-                score, _ = evaluate_checkpoint(ckpt_abs, context, log_path)
+                score, metrics = evaluate_checkpoint(
+                    ckpt_abs, context, log_path
+                )
         except Exception as exc:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8", errors="replace") as log_file:
@@ -447,7 +650,19 @@ def run_selection(args, checkpoints: List[Path], existing: Dict[str, CheckpointR
             results.append(CheckpointResult(ckpt_key, epoch, None, "parse_failed", error))
         else:
             print(f"  {args.metric}: {score:.8f}")
-            results.append(CheckpointResult(ckpt_key, epoch, score, "ok"))
+            if metrics and metrics.get("val/inference_seconds_mean") is not None:
+                print(
+                    f"  mean inference seconds: "
+                    f"{metrics['val/inference_seconds_mean']:.3f}"
+                )
+            results.append(CheckpointResult(
+                ckpt_key,
+                epoch,
+                score,
+                "ok",
+                direction=("higher" if args.metric == "official" else "lower"),
+                metrics=metrics,
+            ))
 
         write_results(rank_results(results), output_dir)
 
@@ -456,12 +671,33 @@ def run_selection(args, checkpoints: List[Path], existing: Dict[str, CheckpointR
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Select the best checkpoint by local validation loss.")
-    parser.add_argument("--metric", choices=["loss", "cd"], default="loss",
-                        help="loss=训练损失代理; cd=验证集上真实 Chamfer Distance，与竞赛评分对齐")
+    parser.add_argument(
+        "--metric",
+        choices=["loss", "cd", "official"],
+        default="loss",
+        help=(
+            "loss=训练损失代理; cd=Chamfer; "
+            "official=按 50%% CD_score + 50%% P2S_score 最大化"
+        ),
+    )
     parser.add_argument("--cd_points", type=int, default=32768, help="CD 模式每个模型采样点数")
     parser.add_argument("--cd_limit", type=int, default=None, help="CD 模式最多评估多少个验证模型")
+    parser.add_argument(
+        "--patch_batch_size",
+        type=int,
+        default=None,
+        help=(
+            "cd/official 推理时每个 GPU 小批处理的 patch 数。"
+            "默认 64（约占用 16GB 卡上更多显存）；OOM 时改为 48 或 32"
+        ),
+    )
     parser.add_argument("--noise_std_min", type=float, default=0.005, help="CD 模式加噪 std 下限")
     parser.add_argument("--noise_std_max", type=float, default=0.020, help="CD 模式加噪 std 上限")
+    parser.add_argument(
+        "--mesh_root",
+        default="dataset_train",
+        help="official 模式原始 mesh 根目录（其下应包含 shapenet/）",
+    )
     parser.add_argument("--ckpt_dir", default="experiments/vm", help="Directory containing checkpoint_*.pkl files.")
     parser.add_argument("--pattern", default="checkpoint_*.pkl", help="Checkpoint filename pattern.")
     parser.add_argument("--task_template", default="configs/task/train_vm.yaml", help="Training task yaml.")
@@ -481,6 +717,9 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="Skip checkpoints already marked ok in checkpoint_ranking.json.")
     parser.add_argument("--copy_best", action="store_true", help="Copy the best checkpoint to output_dir/best_checkpoint.pkl.")
     args = parser.parse_args()
+    if args.metric in ("cd", "official") and args.patch_batch_size is None:
+        # Default was ~33 patches/step (~5GB). 64 better fills a 16GB card.
+        args.patch_batch_size = 64
 
     ckpt_dir = Path(args.ckpt_dir)
     output_dir = Path(args.output_dir)

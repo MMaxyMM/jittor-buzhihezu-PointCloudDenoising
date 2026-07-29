@@ -21,23 +21,25 @@ class CosineSchedule:
         alpha_bar = np.clip(alpha_bar, 0.0, 1.0)
         self.alphas_np = np.sqrt(alpha_bar).astype(np.float32)
         self.sigmas_np = np.sqrt(1.0 - alpha_bar).astype(np.float32)
+        # Keep device tensors so timestep lookup never copies a Var to NumPy.
+        self.alphas = jt.array(self.alphas_np).float32()
+        self.sigmas = jt.array(self.sigmas_np).float32()
 
     def coefficients(self, indices) -> Tuple[jt.Var, jt.Var]:
         """Return broadcastable alpha and sigma for integer timestep indices."""
-        if isinstance(indices, jt.Var):
-            index_array = indices.numpy().astype(np.int64)
-        else:
-            index_array = np.asarray(indices, dtype=np.int64)
-        alpha = jt.array(self.alphas_np[index_array]).float32()
-        sigma = jt.array(self.sigmas_np[index_array]).float32()
+        if not isinstance(indices, jt.Var):
+            indices = jt.array(np.asarray(indices, dtype=np.int32))
+        indices = indices.int32()
+        alpha = self.alphas[indices]
+        sigma = self.sigmas[indices]
         return alpha.reshape(-1, 1, 1), sigma.reshape(-1, 1, 1)
 
     def inference_indices(self, num_inference_steps: int) -> np.ndarray:
-        """Descending unique indices including both the noisy and clean ends."""
+        """Descending indices from T-1 to 0, excluding singular endpoints."""
         if num_inference_steps < 1:
             raise ValueError("num_inference_steps must be positive")
         indices = np.rint(
-            np.linspace(self.num_train_steps, 0, num_inference_steps + 1)
+            np.linspace(self.num_train_steps - 1, 0, num_inference_steps + 1)
         ).astype(np.int64)
         return np.unique(indices)[::-1]
 

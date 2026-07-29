@@ -26,7 +26,12 @@ def get_optimizer(optimizer_config, model):
     if __target__ not in MAPPING:
         raise ValueError(f"unsupported optimizer: {__target__}")
     OptimizerClass = MAPPING[__target__]
-    optimizer = OptimizerClass(model.parameters(), **optimizer_config)
+    parameters = (
+        model.get_optim_parameters()
+        if hasattr(model, "get_optim_parameters")
+        else model.parameters()
+    )
+    optimizer = OptimizerClass(parameters, **optimizer_config)
     return optimizer
 
 class DummyWriter():
@@ -65,7 +70,32 @@ class DummySystem():
         self.min_lr_ratio = float(trainer_config.get('min_lr_ratio', 0.0))
         self.gradient_clip_norm = trainer_config.get('gradient_clip_norm', None)
         self.ema_decay = float(trainer_config.get('ema_decay', 0.0))
-        self._global_step = 0
+        self.validate_every_n_epochs = int(
+            trainer_config.get("validate_every_n_epochs", 1)
+        )
+        if self.validate_every_n_epochs < 1:
+            raise ValueError("validate_every_n_epochs must be positive")
+        self.checkpoint_every_n_epochs = int(
+            trainer_config.get("checkpoint_every_n_epochs", 1)
+        )
+        if self.checkpoint_every_n_epochs < 1:
+            raise ValueError("checkpoint_every_n_epochs must be positive")
+        self.start_epoch = int(trainer_config.get("start_epoch", 0))
+        self._global_step = int(trainer_config.get("global_step", 0))
+        model_init_checkpoint = trainer_config.get("model_init_checkpoint")
+        resume_checkpoint = trainer_config.get("resume_checkpoint")
+        self.resume_checkpoint = resume_checkpoint
+        if model_init_checkpoint and resume_checkpoint:
+            raise ValueError(
+                "set only one of model_init_checkpoint/resume_checkpoint"
+            )
+        initial_checkpoint = resume_checkpoint or model_init_checkpoint
+        if initial_checkpoint:
+            if not os.path.isfile(initial_checkpoint):
+                raise FileNotFoundError(
+                    f"initial checkpoint does not exist: {initial_checkpoint}"
+                )
+            model.load(initial_checkpoint)
         
         if optimizer_config is not None and model is not None:
             self.optimizer = get_optimizer(optimizer_config, model)
@@ -74,13 +104,33 @@ class DummySystem():
         self.base_lr = (
             float(self.optimizer.lr) if self.optimizer is not None else 0.0
         )
+        if self.resume_checkpoint:
+            state_path = f"{self.resume_checkpoint}.state.pkl"
+            if os.path.isfile(state_path):
+                state = jt.load(state_path)
+                self.start_epoch = int(state.get("epoch", -1)) + 1
+                self._global_step = int(
+                    state.get("global_step", self._global_step)
+                )
+                optimizer_state = state.get("optimizer")
+                if (
+                    optimizer_state is not None
+                    and self.optimizer is not None
+                    and hasattr(self.optimizer, "load_state_dict")
+                ):
+                    self.optimizer.load_state_dict(optimizer_state)
         self._ema_parameters = None
         if self.ema_decay > 0.0:
             if not 0.0 < self.ema_decay < 1.0:
                 raise ValueError("ema_decay must be in (0, 1)")
+            parameters = (
+                self.model.get_optim_parameters()
+                if hasattr(self.model, "get_optim_parameters")
+                else self.model.parameters()
+            )
             self._ema_parameters = [
                 parameter.detach().clone()
-                for parameter in self.model.parameters()
+                for parameter in parameters
             ]
         
         self._validation_loss = defaultdict(list)
@@ -169,8 +219,13 @@ class DummySystem():
         if self._ema_parameters is None:
             return
         with jt.no_grad():
+            parameters = (
+                self.model.get_optim_parameters()
+                if hasattr(self.model, "get_optim_parameters")
+                else self.model.parameters()
+            )
             for ema_parameter, parameter in zip(
-                self._ema_parameters, self.model.parameters()
+                self._ema_parameters, parameters
             ):
                 ema_parameter.assign(
                     self.ema_decay * ema_parameter
@@ -182,13 +237,27 @@ class DummySystem():
             self.model.save(checkpoint_path)
             return
         with jt.no_grad():
-            parameters = list(self.model.parameters())
+            parameters = list(
+                self.model.get_optim_parameters()
+                if hasattr(self.model, "get_optim_parameters")
+                else self.model.parameters()
+            )
             backup = [parameter.detach().clone() for parameter in parameters]
             for parameter, ema_parameter in zip(parameters, self._ema_parameters):
                 parameter.assign(ema_parameter)
             self.model.save(checkpoint_path)
             for parameter, original in zip(parameters, backup):
                 parameter.assign(original)
+
+    def _save_training_state(self, checkpoint_path, epoch):
+        state = {
+            "epoch": int(epoch),
+            "global_step": int(self._global_step),
+            "optimizer": None,
+        }
+        if self.optimizer is not None and hasattr(self.optimizer, "state_dict"):
+            state["optimizer"] = self.optimizer.state_dict()
+        jt.save(state, f"{checkpoint_path}.state.pkl")
     
     def on_predict_epoch_start(self):
         pass
@@ -214,11 +283,12 @@ class DummySystem():
             1, len(train_dataloader) // train_dataloader.batch_size
         )
         total_steps = self.epochs * steps_per_epoch
-        for epoch in range(self.epochs):
+        # Reuse one dataloader for all epochs. Recreating workers every epoch
+        # previously leaked shared memory and OOM-killed training on 16GB hosts.
+        validate_dataloader = self.dataset_module.validate_dataloader()
+        for epoch in range(self.start_epoch, self.epochs):
             self.model.train()
             self.on_train_epoch_start()
-            train_dataloader = self.dataset_module.train_dataloader()
-            assert train_dataloader is not None, "train_dataloader is None"
             pbar = tqdm(train_dataloader, total=len(train_dataloader)//train_dataloader.batch_size) # type: ignore
             for batch in pbar:
                 self.on_train_batch_start()
@@ -235,8 +305,11 @@ class DummySystem():
             self.on_train_epoch_end()
             
             self.model.eval()
-            validate_dataloader = self.dataset_module.validate_dataloader()
-            if validate_dataloader is not None:
+            should_validate = (
+                (epoch + 1) % self.validate_every_n_epochs == 0
+                or epoch + 1 == self.epochs
+            )
+            if validate_dataloader is not None and should_validate:
                 self.on_validation_epoch_start()
                 if isinstance(validate_dataloader, dict):
                     for name, dataloader in validate_dataloader.items():
@@ -255,9 +328,20 @@ class DummySystem():
                         self.on_validation_batch_end()
                 self.on_validation_epoch_end()
             
-            checkpoint_path = os.path.join(self.ckpt_save_dir, f'{self.ckpt_save_name}_{epoch}.pkl')
-            os.makedirs(self.ckpt_save_dir, exist_ok=True)
-            self._save_checkpoint(checkpoint_path)
+            should_checkpoint = (
+                (epoch + 1) % self.checkpoint_every_n_epochs == 0
+                or epoch + 1 == self.epochs
+            )
+            if should_checkpoint:
+                checkpoint_path = os.path.join(
+                    self.ckpt_save_dir,
+                    f'{self.ckpt_save_name}_{epoch}.pkl',
+                )
+                os.makedirs(self.ckpt_save_dir, exist_ok=True)
+                self._save_checkpoint(checkpoint_path)
+                self._save_training_state(checkpoint_path, epoch)
+            if hasattr(jt, "gc"):
+                jt.gc()
     
     def predict(self):
         # only iterate once

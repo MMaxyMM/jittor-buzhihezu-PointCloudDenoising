@@ -1,0 +1,27 @@
+mode: train
+
+components:
+  data: train_anchored_cached
+  transform: anchored_diffusion
+  system: anchored_diffusion_stage1
+  model: anchored_diffusion_stage1
+
+loss:
+  loss: 1.0
+
+optimizer:
+  __target__: adam
+  lr: 0.0002
+
+trainer:
+  # 600k patch exposures; leaves time for Stage 2 and score sweeps.
+  epochs: 100
+  scheduler: cosine
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.05
+  gradient_clip_norm: 1.0
+  ema_decay: 0.9995
+  validate_every_n_epochs: 2
+  # Save every epoch while continuing past epoch 59, to avoid losing progress.
+  checkpoint_every_n_epochs: 1
+  resume_checkpoint: experiments/anchored_diffusion_stage1/checkpoint_79.pkl

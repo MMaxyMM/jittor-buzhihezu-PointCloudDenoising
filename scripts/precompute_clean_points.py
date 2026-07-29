@@ -53,8 +53,16 @@ def process_one(task: Tuple[str, str, str, int, int, bool]) -> Tuple[str, str]:
     source = input_root / relative / "models" / "model_normalized.obj"
     destination = output_root / relative / "clean.npy"
     vertices_destination = output_root / relative / "vertices.npy"
+    normals_destination = output_root / relative / "normals.npy"
+    vertex_normals_destination = output_root / relative / "vertex_normals.npy"
 
-    if destination.exists() and vertices_destination.exists() and not overwrite:
+    if (
+        destination.exists()
+        and vertices_destination.exists()
+        and normals_destination.exists()
+        and vertex_normals_destination.exists()
+        and not overwrite
+    ):
         return "skipped", relative.as_posix()
 
     try:
@@ -64,20 +72,36 @@ def process_one(task: Tuple[str, str, str, int, int, bool]) -> Tuple[str, str]:
             raise ValueError(f"unexpected mesh vertex shape: {vertices.shape}")
         if not np.isfinite(vertices).all():
             raise ValueError("mesh vertices contain non-finite values")
+        vertex_normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+        if vertex_normals.shape != vertices.shape or not np.isfinite(vertex_normals).all():
+            raise ValueError("mesh vertex normals are invalid")
 
-        # Keep an existing surface cache when only vertices.npy is missing.
-        # Use --overwrite when changing the requested surface-point count.
-        if overwrite or not destination.exists():
+        # Replaying the original deterministic sample lets old clean caches gain
+        # exact paired normals without changing any point coordinates.
+        if overwrite or not destination.exists() or not normals_destination.exists():
             np.random.seed(sample_seed(seed, relative))
-            points, _ = trimesh.sample.sample_surface(mesh, num_points)
+            points, face_indices = trimesh.sample.sample_surface(mesh, num_points)
             points = np.asarray(points, dtype=np.float32)
             if points.shape != (num_points, 3):
                 raise ValueError(f"unexpected sampled shape: {points.shape}")
             if not np.isfinite(points).all():
                 raise ValueError("sampled points contain non-finite values")
-            atomic_save(destination, points)
+            normals = np.asarray(mesh.face_normals[face_indices], dtype=np.float32)
+            if destination.exists() and not overwrite:
+                existing = np.load(destination)
+                if existing.shape != points.shape or not np.allclose(
+                    existing, points, rtol=0.0, atol=1e-7
+                ):
+                    raise ValueError(
+                        "existing clean.npy does not match deterministic resampling; "
+                        "rerun with --overwrite to regenerate paired points/normals"
+                    )
+            else:
+                atomic_save(destination, points)
+            atomic_save(normals_destination, normals)
 
         atomic_save(vertices_destination, vertices)
+        atomic_save(vertex_normals_destination, vertex_normals)
         return "written", relative.as_posix()
     except Exception as exc:
         return "failed", f"{relative.as_posix()}: {type(exc).__name__}: {exc}"

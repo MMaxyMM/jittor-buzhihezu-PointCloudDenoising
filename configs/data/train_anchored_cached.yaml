@@ -1,0 +1,32 @@
+data_name: &data_name clean.npy
+loader: &loader clean_npy
+
+train_dataset:
+  shuffle: true
+  # Host RAM is ~15GB; 16 workers previously triggered Linux OOM.
+  batch_size: 8
+  num_workers: 2
+  datapath:
+    input_dataset_dir: ./dataset_train_pcd
+    use_prob: true
+    num_files: 10000
+    loader: *loader
+    data_name: *data_name
+    ignore_check: false
+    data_path:
+      shapenet:
+        - [./datalist/train.txt, 1.0]
+
+validate_dataset:
+  shuffle: false
+  batch_size: 1
+  num_workers: 1
+  datapath:
+    input_dataset_dir: ./dataset_train_pcd
+    use_prob: false
+    loader: *loader
+    data_name: *data_name
+    ignore_check: false
+    data_path:
+      shapenet:
+        - [./datalist/validate.txt, 1.0]

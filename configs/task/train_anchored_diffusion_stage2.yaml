@@ -1,0 +1,27 @@
+mode: train
+
+components:
+  data: train_anchored_cached
+  transform: anchored_diffusion
+  system: anchored_diffusion_stage2
+  model: anchored_diffusion_stage2
+
+loss:
+  loss: 1.0
+
+optimizer:
+  __target__: adam
+  lr: 0.00005
+
+trainer:
+  # Longer low-LR geometry fine-tuning without changing model capacity.
+  epochs: 30
+  scheduler: cosine
+  warmup_ratio: 0.01
+  min_lr_ratio: 0.05
+  gradient_clip_norm: 1.0
+  ema_decay: 0.9995
+  validate_every_n_epochs: 1
+  checkpoint_every_n_epochs: 1
+  # Continue after JIT crash; checkpoint_1 was the last successful save.
+  resume_checkpoint: experiments/anchored_diffusion_stage2/checkpoint_1.pkl

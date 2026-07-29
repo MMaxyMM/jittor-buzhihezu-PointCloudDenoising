@@ -1,7 +1,8 @@
 predict_dataset:
   shuffle: False
   batch_size: 1
-  num_workers: 8
+  # Predict is cloud-by-cloud; fewer workers avoid host-RAM contention.
+  num_workers: 2
   datapath:
     input_dataset_dir: ./dataset_test_noisy
     use_prob: False
