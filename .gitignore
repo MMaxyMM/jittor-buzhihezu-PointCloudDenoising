@@ -5,6 +5,7 @@ __pycache__/
 # Local datasets and archives
 dataset_train/
 dataset_train_pcd/
+dataset_train_pcd_disk/
 dataset_test_noisy/
 dataset_train.tar.gz
 dataset_test_noisy.zip
@@ -14,6 +15,7 @@ BestModel/
 experiments/
 results/
 checkpoint_selection*/
+pipeline_results/
 result.zip
 
 # Local environments and tooling

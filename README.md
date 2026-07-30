@@ -63,17 +63,6 @@ python scripts/ensemble_predict.py \
 - 输出结构与 VMWriter 一致，打包方式相同
 - 建议先用 `--limit 2` 冒烟，再在验证集上确认集成优于单模型后再用于提交
 
-### cosine 学习率调度
-
-trainer 配置支持余弦衰减（`src/system/spec.py`），长训练时推荐开启：
-
-```yaml
-trainer:
-  epochs: 150
-  lr_decay: cosine       # 默认 none
-  lr_min_ratio: 0.01     # 最终 lr = 初始 lr × 0.01
-```
-
 ### loss_type：Charbonnier 与 L2 切换
 
 模型配置（VM / CVM / StraightPCF 均支持）新增 `loss_type`：
@@ -99,11 +88,47 @@ feat_embedding_dim: 384      # 256 → 384
 # configs/task/train_vm_cached.yaml
 trainer:
   epochs: 150
-  lr_decay: cosine
-  lr_min_ratio: 0.01
 ```
 
 验收标准：与当前最优模型在同一验证集、同一噪声种子下对比，总分提升 ≥0.5 且 CD/P2S 单项回退 ≤0.3 才替换；未达标则回退旧配置。
+
+## 完整三阶段训练与本地验证流水线
+
+该入口是纯 Bash 编排，只调用现有训练、筛选和评估脚本，不复制或改写模型训练逻辑。
+
+仓库中的第二阶段模型名为 CVM（`CoupledVelocityModule`）；如果将其称为 SVM，流水线会按 VM → CVM → StraightPCF 的实际依赖顺序执行。
+
+数据仍在上传时只做检查，不会创建数据、训练或覆盖 checkpoint：
+
+```bash
+bash scripts/train_select_evaluate.sh --check-only
+bash scripts/train_select_evaluate.sh --dry-run
+```
+
+数据上传完成后运行完整流程：
+
+```bash
+bash scripts/train_select_evaluate.sh
+```
+
+完整流程依次执行：
+
+1. 创建固定 `local_train/local_test` 留出划分。
+2. 生成动态训练 clean 缓存和固定噪声 `local_test`。
+3. 训练 VM，并以 loss/CD/P2S 综合指标筛选最优 checkpoint。
+4. 用最优 VM 初始化并训练 CVM，再筛选最优 checkpoint。
+5. 用最优 CVM 初始化 StraightPCF，冻结速度网络并训练距离模块，再筛选最优 checkpoint。
+6. 在同一套固定 `local_test` 上评估 VM、CVM、StraightPCF。
+
+默认快速 CD 初筛覆盖全部 epoch（`--prefilter-last-n 0`），再对前 10 名做完整综合评估。中断后可按阶段继续，例如：
+
+```bash
+bash scripts/train_select_evaluate.sh \
+  --from-stage select-vm \
+  --resume-selection
+```
+
+`--resume` 会跳过已有完成产物的阶段；只有确认需要重建划分或缓存时才使用 `--overwrite-split` / `--overwrite-cache`。最终评分写入 `pipeline_results/local_test_results.txt`。
 
 ## 环境安装
 
@@ -123,12 +148,10 @@ python -m pip install -r requirements.txt
 - `trimesh`
 - `scipy`
 - `omegaconf`
+- `point-cloud-utils`
+- `plotly`
 
-如需运行 `evaluate.py` 的精确 P2S 计算，可额外安装：
-
-```bash
-pip install point-cloud-utils
-```
+`point-cloud-utils` 用于 checkpoint 综合筛选和固定 local_test 的精确 P2S；`plotly` 用于可视化脚本。
 
 ### 多 worker 训练时限制 CPU 线程
 
