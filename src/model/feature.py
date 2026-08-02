@@ -4,8 +4,14 @@ from jittor import nn
 import jittor as jt
 
 class EdgeConv(nn.Module):
-    def __init__(self, in_channels, out_channels, activation: Optional[str]='ReLU'):
+    def __init__(
+        self, in_channels, out_channels, activation: Optional[str]='ReLU',
+        aggregation: str='mean'
+    ):
         super().__init__()
+        if aggregation not in ('mean', 'max'):
+            raise ValueError(f"unsupported EdgeConv aggregation: {aggregation}")
+        self.aggregation = aggregation
         
         if activation == 'ReLU':
             self.mlp = nn.Sequential(
@@ -45,25 +51,41 @@ class EdgeConv(nn.Module):
         msg = self.mlp(tmp)  # (E, out_channels)
         
         N = x.shape[0]
-        out = jt.full((N, msg.shape[1]), 0)
-        cnt = jt.full((N, msg.shape[1]), 0)
-        
-        # scatter mean
-        out = out.scatter_(0, dst.unsqueeze(1).broadcast(msg.shape), msg, reduce='add')
-        cnt = cnt.scatter_(0, dst.unsqueeze(1).broadcast(msg.shape), jt.ones_like(msg), reduce='add')
-        out = out / (cnt + 1)
+        if self.aggregation == 'max':
+            if msg.shape[0] % N != 0:
+                raise RuntimeError(
+                    f"EdgeConv expects a fixed number of neighbors per point, "
+                    f"but got {msg.shape[0]} messages for {N} points"
+                )
+
+            # get_edge_index 按 (batch, target point, neighbor) 连续排列消息。
+            # 因而可直接恢复 (N, K, C) 并按邻居维取最大值，等价于
+            # PyG MessagePassing(aggr='max')，同时保留对最大消息的梯度。
+            out = jt.max(msg.reshape(N, -1, msg.shape[1]), dim=1)
+        else:
+            # 兼容已有 checkpoint：保留原 baseline 的聚合与缩放行为。
+            out = jt.full((N, msg.shape[1]), 0)
+            cnt = jt.full((N, msg.shape[1]), 0)
+            out = out.scatter_(
+                0, dst.unsqueeze(1).broadcast(msg.shape), msg, reduce='add'
+            )
+            cnt = cnt.scatter_(
+                0, dst.unsqueeze(1).broadcast(msg.shape),
+                jt.ones_like(msg), reduce='add'
+            )
+            out = out / (cnt + 1)
         out_2 = self.lin(x)
         return out + out_2
 
 class DynamicEdgeConv(EdgeConv):
-    def __init__(self, in_channels, out_channels, activation: Optional[str]='ReLU'):
-        super().__init__(in_channels, out_channels, activation)
+    def __init__(self, in_channels, out_channels, activation: Optional[str]='ReLU', aggregation: str='mean'):
+        super().__init__(in_channels, out_channels, activation, aggregation)
     
     def execute(self, x, edge_index):
         return super().execute(x, edge_index)
 
 class FeatureExtraction(nn.Module):
-    def __init__(self, k=32, input_dim=0, embedding_dim=512, distance_estimation=False):
+    def __init__(self, k=32, input_dim=0, embedding_dim=512, distance_estimation=False, aggregation='mean'):
         super().__init__()
 
         self.k = k
@@ -71,12 +93,13 @@ class FeatureExtraction(nn.Module):
         self.embedding_dim = embedding_dim
         self.distance_estimation = distance_estimation
 
-        self.conv1 = DynamicEdgeConv(self.input_dim, embedding_dim // 8)
-        self.conv2 = DynamicEdgeConv(embedding_dim // 8, embedding_dim // 4)
+        self.conv1 = DynamicEdgeConv(self.input_dim, embedding_dim // 8, aggregation=aggregation)
+        self.conv2 = DynamicEdgeConv(embedding_dim // 8, embedding_dim // 4, aggregation=aggregation)
         self.conv3 = DynamicEdgeConv(
             embedding_dim // 8 + embedding_dim // 4,
             embedding_dim,
-            activation=None
+            activation=None,
+            aggregation=aggregation,
         )
 
     # ========= edge_index 构建 =========

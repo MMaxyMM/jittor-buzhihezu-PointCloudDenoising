@@ -204,13 +204,16 @@ class AugmentPatch(Augment):
             return
 
         l1, l2 = 1e-8, 1.0
-        t = np.random.rand(self.num_patches, self.patch_size, 1)
-        t = (l2 - l1) * t + l1
-        
+        # Use one interpolation time for every point in the same patch. This
+        # preserves local geometry seen by the dynamic KNN graph.
+        t = np.random.uniform(
+            l1, l2, size=(self.num_patches, 1, 1)
+        ).astype(np.float32)
+
         pat_t = t * pat_B + (1 - t) * pat_A
         seed_points_t = (
-            t[:, 0:1, :] * pc[seed_idx][:, None, :] +
-            (1 - t[:, 0:1, :]) * pc_noisy[seed_idx][:, None, :]
+            t * pc[seed_idx][:, None, :] +
+            (1 - t) * pc_noisy[seed_idx][:, None, :]
         )
         
         pat_A = pat_A - seed_points_t

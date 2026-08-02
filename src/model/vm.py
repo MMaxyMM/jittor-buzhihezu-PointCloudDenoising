@@ -31,7 +31,8 @@ class VelocityModule(ModelSpec):
         self.encoder = FeatureExtraction(
             k=self.frame_knn,
             input_dim=3,
-            embedding_dim=cfg['feat_embedding_dim']
+            embedding_dim=cfg['feat_embedding_dim'],
+            aggregation=cfg.get('edge_aggregation', 'mean'),
         )
         
         self.decoder = Decoder(
@@ -117,6 +118,7 @@ class VelocityModule(ModelSpec):
         # 对拉普拉斯重尾残留的离群点有效；>1 时需验证细节不过度收缩
         num_steps = int(self.model_config.get('predict_rounds', 1))
         fusion = self.model_config.get('fusion_mode', 'best')
+        residual_alpha = float(self.model_config.get('residual_alpha', 1.0))
         res = []
         for i, pc_noisy in enumerate(pc_noisy_batch):
             pc_next = pc_noisy
@@ -133,7 +135,9 @@ class VelocityModule(ModelSpec):
                     # patch 推理失败时回退上一步结果，保证输出完整
                     break
                 pc_next = pc_out
-            pc_denoised = pc_next.detach().numpy()
+            # 对完整点云的最终残差统一缩放；alpha=1 保持原始推理。
+            pc_next = pc_noisy + residual_alpha * (pc_next - pc_noisy)
+            pc_denoised = pc_next.detach().numpy().astype(np.float32, copy=False)
             res.append({"pc_denoised": pc_denoised})
         return res
     

@@ -1,4 +1,8 @@
-"""Jittor implementation of the coupled and distance-aware StraightPCF stages."""
+"""Jittor implementation of the coupled and distance-aware StraightPCF stages.
+
+The architecture is adapted from the MIT-licensed StraightPCF reference
+implementation. See NOTICE for attribution and the paper citation.
+"""
 
 import os
 from typing import Dict, List
@@ -30,6 +34,7 @@ def _velocity_config(cfg: Dict) -> Dict:
         "dsm_sigma": cfg["dsm_sigma"],
         "feat_embedding_dim": cfg["velocity_embedding_dim"],
         "decoder_hidden_dim": cfg["decoder_hidden_dim"],
+        "edge_aggregation": cfg.get("edge_aggregation", "mean"),
     }
 
 
@@ -61,6 +66,7 @@ class _StraightPCFBase(ModelSpec):
         self.patch_size = cfg.get("patch_size", 1000)
         self.seed_k = cfg.get("seed_k", 6)
         self.seed_k_alpha = cfg.get("seed_k_alpha", 1)
+        self.residual_alpha = float(cfg.get("residual_alpha", 1.0))
 
     @jt.no_grad()
     def predict_step(self, batch: Dict) -> List[Dict]:
@@ -81,6 +87,9 @@ class _StraightPCFBase(ModelSpec):
                     # patch 推理失败时回退上一步结果，保证输出完整
                     break
                 pc_current = denoised
+            # 与本地 alpha oracle 一致：在所有 patch/round 完成后，
+            # 以原始 noisy 点云为基准统一缩放最终位移。
+            pc_current = pc_noisy + self.residual_alpha * (pc_current - pc_noisy)
             denoised = pc_current.detach().numpy().astype(np.float32, copy=False)
             if denoised.shape != tuple(pc_noisy.shape):
                 raise RuntimeError(
@@ -204,8 +213,6 @@ class StraightPCFModule(_StraightPCFBase):
         cvm = CoupledVelocityModule(cvm_config, transform_config)
         cvm.load(cvm_checkpoint)
         self.velocity_nets = cvm.velocity_nets
-        for parameter in self.velocity_nets.parameters():
-            parameter.stop_grad()
 
         embedding_dim = cfg.get("distance_embedding_dim", 128)
         self.distance_encoder = FeatureExtraction(
@@ -213,6 +220,7 @@ class StraightPCFModule(_StraightPCFBase):
             input_dim=3,
             embedding_dim=embedding_dim,
             distance_estimation=True,
+            aggregation=cfg.get("edge_aggregation", "mean"),
         )
         self.distance_decoder = Decoder(
             z_dim=embedding_dim,
@@ -221,6 +229,32 @@ class StraightPCFModule(_StraightPCFBase):
             hidden_size=cfg["decoder_hidden_dim"],
         )
         self.finetune_weight = cfg.get("finetune_weight", 200.0)
+        self._keep_velocity_eval_with_grad()
+
+    def _keep_velocity_eval_with_grad(self):
+        """Freeze BN/dropout state while retaining endpoint gradients.
+
+        Jittor's Module.eval() also calls stop_grad() on all parameters, unlike
+        PyTorch. Set only the module mode flags here, then explicitly keep the
+        velocity parameters trainable.
+        """
+        for module in self.velocity_nets.modules():
+            module.is_train = False
+        for name, parameter in self.velocity_nets.named_parameters():
+            # BN running statistics are state, not trainable affine parameters.
+            # Jittor exposes them through named_parameters(), so keep them
+            # stopped while allowing weights/biases to receive endpoint grads.
+            if name.endswith("running_mean") or name.endswith("running_var"):
+                parameter.stop_grad()
+            else:
+                parameter.start_grad()
+
+    def train(self):
+        # DummySystem calls model.train() at every epoch. Restore eval mode for
+        # velocity BN/dropout after the recursive train-mode switch.
+        super().train()
+        self._keep_velocity_eval_with_grad()
+        return self
 
     def _predict_distance(self, pc):
         batch_size, num_points, _ = pc.shape
@@ -245,13 +279,10 @@ class StraightPCFModule(_StraightPCFBase):
         )
 
         for velocity_net in self.velocity_nets:
-            # 速度网络已冻结，其输出仅作为与 pred_distance 相乘的常量，
-            # 无需构建梯度图；endpoint_loss 的梯度经乘法项回流到 distance 模块
-            with jt.no_grad():
-                feat = velocity_net.encoder(pc_current)
-                pred_dir = velocity_net.decoder(
-                    c=feat.reshape(-1, feat.shape[-1])
-                ).reshape(batch_size, num_points, dims)
+            feat = velocity_net.encoder(pc_current)
+            pred_dir = velocity_net.decoder(
+                c=feat.reshape(-1, feat.shape[-1])
+            ).reshape(batch_size, num_points, dims)
             pc_current = pc_current + pred_distance * pred_dir / self.num_modules
 
         endpoint_loss = _charbonnier_vector_loss(pc_clean - pc_current)

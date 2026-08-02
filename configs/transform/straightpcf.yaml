@@ -7,6 +7,7 @@ train_transform:
     - __target__: add_noise
       noise_std_min: 0.005
       noise_std_max: 0.020
+      noise_type: laplace
     - __target__: linear
       scale: [0.8, 1.2]
       rotate_x_range: [-180, 180]
@@ -28,6 +29,7 @@ validate_transform:
     - __target__: add_noise
       noise_std_min: 0.005
       noise_std_max: 0.020
+      noise_type: laplace
     - __target__: patch
       patch_size: 1000
       num_patches: 1
