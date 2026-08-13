@@ -24,8 +24,44 @@ def get_optimizer(optimizer_config, model):
     if __target__ not in MAPPING:
         raise ValueError(f"unsupported optimizer: {__target__}")
     OptimizerClass = MAPPING[__target__]
-    optimizer = OptimizerClass(model.parameters(), **optimizer_config)
-    return optimizer
+
+    # 可选参数分组（阶段 3 保护 CVM 预训练权重）：
+    #   optimizer:
+    #     __target__: adam
+    #     lr: 0.0001
+    #     param_groups:
+    #       - {prefix: velocity_nets, lr: 1e-5}
+    # 按参数名前缀匹配，未匹配的参数使用顶层 lr；不配置时行为与原来完全一致。
+    param_group_rules = optimizer_config.pop('param_groups', None)
+    if not param_group_rules:
+        return OptimizerClass(model.parameters(), **optimizer_config)
+
+    named_parameters = list(model.named_parameters())
+    used_names = set()
+    param_groups = []
+    for rule in param_group_rules:
+        rule = dict(rule)
+        prefix = rule.pop('prefix')
+        matched_names = [
+            n for n, _ in named_parameters
+            if n.startswith(prefix) and n not in used_names
+        ]
+        if not matched_names:
+            raise ValueError(
+                f"param_groups prefix `{prefix}` matched no parameters"
+            )
+        used_names.update(matched_names)
+        group_params = [p for n, p in named_parameters if n in matched_names]
+        param_groups.append({'params': group_params, **rule})
+    rest = [p for n, p in named_parameters if n not in used_names]
+    if rest:
+        param_groups.append({'params': rest})
+    summary = ", ".join(
+        f"{len(group['params'])} tensors(lr={group.get('lr', optimizer_config.get('lr'))})"
+        for group in param_groups
+    )
+    print(f"optimizer param groups: {summary}")
+    return OptimizerClass(param_groups, **optimizer_config)
 
 class DummyWriter():
     

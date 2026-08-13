@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import tempfile
 import warnings
 from collections import defaultdict
@@ -19,6 +20,12 @@ import point_cloud_utils as pcu
 import trimesh
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+
+# 混合噪声采样与训练侧 AugmentAddNoise 共用同一实现，禁止在此另写一套。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from src.data.utils import sample_mixed_noise, validate_noise_mixture
 
 
 OBJ_RELATIVE_PATH = Path("models/model_normalized.obj")
@@ -151,6 +158,25 @@ def add_laplace_noise(
     return (clean + noise).astype(np.float32, copy=False), effective_std
 
 
+def add_mixed_noise(
+    clean: np.ndarray,
+    key: str,
+    seed: int,
+    mixture: list,
+    noise_scale: float,
+) -> Tuple[np.ndarray, float]:
+    """混合噪声路径（--noise_mixture 启用）。
+
+    成分的 min/max 语义与训练侧 AugmentAddNoise 完全一致：laplace 为 scale
+    b、gaussian 为 sigma（注意这与本文件 add_laplace_noise 旧路径的
+    "std、b=std/√2" 语义不同；noise_scale 标定乘子会吸收整体差异）。
+    """
+    rng = np.random.RandomState(stable_seed(seed, key, "noise"))
+    noise, _, scale = sample_mixed_noise(clean.shape, mixture, rng=rng)
+    noise = (noise * noise_scale).astype(np.float32)
+    return (clean + noise).astype(np.float32, copy=False), scale * noise_scale
+
+
 def chamfer_distance(a: np.ndarray, b: np.ndarray) -> float:
     tree_b = cKDTree(b)
     distance_a, _ = tree_b.query(a, k=1)
@@ -183,14 +209,23 @@ def create_sample(task: Dict) -> Dict:
     clean, normalized_mesh, center, normalization_scale = (
         normalize_clean_and_mesh(raw_clean, mesh)
     )
-    noisy, effective_std = add_laplace_noise(
-        clean,
-        entry,
-        task["seed"],
-        task["noise_std_min"],
-        task["noise_std_max"],
-        task["noise_scale"],
-    )
+    if task.get("noise_mixture"):
+        noisy, effective_std = add_mixed_noise(
+            clean,
+            entry,
+            task["seed"],
+            task["noise_mixture"],
+            task["noise_scale"],
+        )
+    else:
+        noisy, effective_std = add_laplace_noise(
+            clean,
+            entry,
+            task["seed"],
+            task["noise_std_min"],
+            task["noise_std_max"],
+            task["noise_scale"],
+        )
     cd = chamfer_distance(noisy, clean)
     p2s = point_to_surface_distance(noisy, normalized_mesh)
 
@@ -222,6 +257,7 @@ def base_task(args, entry: str, noise_scale: float, write: bool) -> Dict:
         "seed": args.seed,
         "noise_std_min": args.noise_std_min,
         "noise_std_max": args.noise_std_max,
+        "noise_mixture": getattr(args, "noise_mixture", None),
         "noise_scale": noise_scale,
         "write": write,
     }
@@ -415,6 +451,17 @@ def parse_args():
     parser.add_argument("--num_vertex_samples", type=int, default=1024)
     parser.add_argument("--noise_std_min", type=float, default=0.005)
     parser.add_argument("--noise_std_max", type=float, default=0.020)
+    parser.add_argument(
+        "--noise_mixture",
+        type=str,
+        default=None,
+        help=(
+            'JSON 混合噪声配置，设置后取代 --noise_std_min/max，例如：'
+            '\'[{"type":"laplace","weight":0.6,"min":0.0075,"max":0.0125},'
+            '{"type":"gaussian","weight":0.2,"min":0.0125,"max":0.020}]\'。'
+            "laplace 的 min/max 为 scale b，gaussian 为 sigma。"
+        ),
+    )
     parser.add_argument("--target_cd", type=float, default=0.000246)
     parser.add_argument("--target_p2s", type=float, default=0.000196)
     parser.add_argument(
@@ -446,6 +493,13 @@ def validate_args(args):
         raise SystemExit("invalid --num_vertex_samples")
     if not 0 < args.noise_std_min <= args.noise_std_max:
         raise SystemExit("invalid noise std range")
+    if args.noise_mixture is not None:
+        try:
+            args.noise_mixture = validate_noise_mixture(
+                json.loads(args.noise_mixture)
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(f"invalid --noise_mixture: {exc}") from exc
     if args.target_cd <= 0 or args.target_p2s <= 0:
         raise SystemExit("target metrics must be positive")
     if args.calibration_limit < 0 or args.workers <= 0:
@@ -503,7 +557,8 @@ def main() -> int:
         "output_dir": str(output_root.resolve()),
         "num_points": args.num_points,
         "num_vertex_samples": args.num_vertex_samples,
-        "noise_type": "laplace",
+        "noise_type": "mixture" if args.noise_mixture else "laplace",
+        "noise_mixture": args.noise_mixture,
         "noise_std_min_before_scale": args.noise_std_min,
         "noise_std_max_before_scale": args.noise_std_max,
         "noise_scale": noise_scale,
