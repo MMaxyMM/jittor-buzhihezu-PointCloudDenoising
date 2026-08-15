@@ -1,0 +1,47 @@
+# 混合噪声版 transform（P3-1 实验用）：与 straightpcf.yaml 的唯一差异是
+# add_noise 改为 B 榜标定后的混合分布：
+#   60% Laplace b∈[0.0075, 0.0125]  —— 主体，对准 B 榜典型噪声区
+#   20% Laplace b∈[0.0050, 0.0200]  —— 长尾覆盖，保留高噪声鲁棒性
+#   20% Gaussian σ∈[0.0125, 0.0200] —— 高斯主体成分（B 榜峰度介于两者之间）
+# 单变量 A/B：除 add_noise 外其余字段与 straightpcf.yaml 完全一致。
+train_transform:
+  augments:
+    - __target__: sample
+      num_samples: 32768
+      num_vertex_samples: 1024
+    - __target__: normalize_pc
+    - __target__: add_noise
+      noise_mixture:
+        - {type: laplace, weight: 0.6, min: 0.0075, max: 0.0125}
+        - {type: laplace, weight: 0.2, min: 0.0050, max: 0.0200}
+        - {type: gaussian, weight: 0.2, min: 0.0125, max: 0.0200}
+    - __target__: linear
+      scale: [0.8, 1.2]
+      rotate_x_range: [-180, 180]
+      rotate_y_range: [-180, 180]
+      rotate_z_range: [-180, 180]
+      scale_p: 0.5
+      rotate_p: 0.5
+    - __target__: patch
+      patch_size: 1000
+      num_patches: 1
+      train_cvm_network: true
+
+validate_transform:
+  augments:
+    - __target__: sample
+      num_samples: 32768
+      num_vertex_samples: 1024
+    - __target__: normalize_pc
+    - __target__: add_noise
+      noise_mixture:
+        - {type: laplace, weight: 0.6, min: 0.0075, max: 0.0125}
+        - {type: laplace, weight: 0.2, min: 0.0050, max: 0.0200}
+        - {type: gaussian, weight: 0.2, min: 0.0125, max: 0.0200}
+    - __target__: patch
+      patch_size: 1000
+      num_patches: 1
+      train_cvm_network: true
+
+predict_transform:
+  augments: []

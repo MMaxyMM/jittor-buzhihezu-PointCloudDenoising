@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -36,6 +37,12 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 from tqdm import tqdm
+
+# 与训练侧共用混合噪声校验逻辑（src/data/__init__.py 为空，此导入很轻）。
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from src.data.utils import validate_noise_mixture
 
 
 OBJ_RELATIVE_PATH = Path("models/model_normalized.obj")
@@ -297,6 +304,7 @@ def generate_fixed_local_test(
         seed=args.seed,
         noise_std_min=args.noise_std_min,
         noise_std_max=args.noise_std_max,
+        noise_mixture=args.noise_mixture,
         target_cd=args.target_cd,
         target_p2s=args.target_p2s,
         calibration_limit=args.calibration_limit,
@@ -346,7 +354,8 @@ def generate_fixed_local_test(
         "num_points": num_points,
         "dtype": "float32",
         "num_vertex_samples": args.num_vertex_samples,
-        "noise_type": "laplace",
+        "noise_type": "mixture" if args.noise_mixture else "laplace",
+        "noise_mixture": args.noise_mixture,
         "noise_std_min_before_scale": args.noise_std_min,
         "noise_std_max_before_scale": args.noise_std_max,
         "noise_scale": noise_scale,
@@ -568,6 +577,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_vertex_samples", type=int, default=1024)
     parser.add_argument("--noise_std_min", type=float, default=0.005)
     parser.add_argument("--noise_std_max", type=float, default=0.020)
+    parser.add_argument(
+        "--noise_mixture",
+        type=str,
+        default=None,
+        help=(
+            "local_test 的 JSON 混合噪声配置（取代 --noise_std_min/max），"
+            '如 \'[{"type":"laplace","weight":0.6,"min":0.0075,"max":0.0125},'
+            '{"type":"gaussian","weight":0.2,"min":0.0125,"max":0.020}]\'。'
+            "laplace 的 min/max 为 scale b，gaussian 为 sigma。"
+        ),
+    )
     parser.add_argument("--target_cd", type=float, default=0.000246)
     parser.add_argument("--target_p2s", type=float, default=0.000196)
     parser.add_argument(
@@ -641,6 +661,13 @@ def parse_args() -> argparse.Namespace:
         )
     if not 0 < args.noise_std_min <= args.noise_std_max:
         raise SystemExit("invalid fixed-test noise std range")
+    if args.noise_mixture is not None:
+        try:
+            args.noise_mixture = validate_noise_mixture(
+                json.loads(args.noise_mixture)
+            )
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(f"invalid --noise_mixture: {exc}") from exc
     if args.target_cd <= 0 or args.target_p2s <= 0:
         raise SystemExit("target CD/P2S must be positive")
     if args.calibration_limit < 0:

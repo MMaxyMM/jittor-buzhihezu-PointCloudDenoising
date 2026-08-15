@@ -252,6 +252,67 @@ def sample_vertex_groups(
     }
     return sampled_vertices, sampled_normals, sampled_vertex_groups, d
 
+def validate_noise_mixture(mixture) -> list:
+    """校验混合噪声配置，返回规范化后的 list[dict]。
+
+    每个成分：{"type": "laplace"|"gaussian", "weight": float,
+    "min": float, "max": float}。laplace 的 min/max 直接是 scale b
+    （与 AugmentAddNoise 的既有语义一致），gaussian 的 min/max 是标准差
+    sigma。训练侧（AugmentAddNoise）与评测侧（generate_local_test_benchmark）
+    必须共用这一套语义，禁止各自实现。
+    """
+    if not isinstance(mixture, (list, tuple)) or len(mixture) == 0:
+        raise ValueError("noise_mixture must be a non-empty list")
+    cleaned = []
+    for index, component in enumerate(mixture):
+        if not isinstance(component, dict):
+            raise ValueError(f"noise_mixture[{index}] must be a mapping")
+        noise_type = component.get("type")
+        if noise_type not in ("laplace", "gaussian"):
+            raise ValueError(
+                f"noise_mixture[{index}].type must be 'laplace' or "
+                f"'gaussian', got {noise_type!r}"
+            )
+        try:
+            weight = float(component["weight"])
+            low = float(component["min"])
+            high = float(component["max"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"noise_mixture[{index}] requires numeric weight/min/max"
+            ) from exc
+        if weight <= 0:
+            raise ValueError(f"noise_mixture[{index}].weight must be positive")
+        if not 0 < low <= high:
+            raise ValueError(
+                f"noise_mixture[{index}] requires 0 < min <= max, "
+                f"got [{low}, {high}]"
+            )
+        cleaned.append(
+            {"type": noise_type, "weight": weight, "min": low, "max": high}
+        )
+    return cleaned
+
+
+def sample_mixed_noise(shape, mixture, rng=np.random):
+    """按权重抽一个成分、采一个强度，生成整片点云的噪声。
+
+    每次调用（即每个点云样本）只选一个成分和一个 scale，与单成分
+    AugmentAddNoise 的既有行为一致。返回 (noise, noise_type, scale)。
+    """
+    mixture = validate_noise_mixture(mixture)
+    weights = np.asarray([c["weight"] for c in mixture], dtype=np.float64)
+    weights /= weights.sum()
+    index = int(rng.choice(len(mixture), p=weights))
+    component = mixture[index]
+    scale = float(rng.uniform(component["min"], component["max"]))
+    if component["type"] == "laplace":
+        noise = rng.laplace(0.0, scale, size=shape)
+    else:
+        noise = rng.normal(0.0, scale, size=shape)
+    return noise, component["type"], scale
+
+
 def random_euler_rotation(
     batch_size: int=1,
     x_range=(0, 0), # degree

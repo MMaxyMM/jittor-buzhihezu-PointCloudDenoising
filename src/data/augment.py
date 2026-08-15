@@ -5,10 +5,16 @@ from scipy.spatial import cKDTree
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import os
 
 from .asset import Asset
 from .spec import ConfigSpec
-from .utils import random_euler_rotation, sample_vertex_groups
+from .utils import (
+    random_euler_rotation,
+    sample_mixed_noise,
+    sample_vertex_groups,
+    validate_noise_mixture,
+)
 
 @dataclass(frozen=True)
 class Augment(ConfigSpec):
@@ -91,30 +97,52 @@ class AugmentNormalizePC(Augment):
 @dataclass(frozen=True)
 class AugmentAddNoise(Augment):
 
-    noise_std_min: float
+    noise_std_min: float=0.005
 
-    noise_std_max: float
+    noise_std_max: float=0.020
 
     noise_type: str="laplace"
+
+    # 可选混合噪声，例如 B 榜标定后的分布：
+    #   noise_mixture:
+    #     - {type: laplace, weight: 0.6, min: 0.0075, max: 0.0125}
+    #     - {type: laplace, weight: 0.2, min: 0.0050, max: 0.0200}
+    #     - {type: gaussian, weight: 0.2, min: 0.0125, max: 0.0200}
+    # laplace 的 min/max 直接是 scale b，gaussian 的 min/max 是 std sigma。
+    # 设置后忽略 noise_std_min/max 与 noise_type。
+    noise_mixture: Optional[list]=None
 
     @classmethod
     def parse(cls, **kwargs) -> 'AugmentAddNoise':
         cls.check_keys(kwargs)
+        if kwargs.get("noise_mixture") is not None:
+            kwargs["noise_mixture"] = validate_noise_mixture(kwargs["noise_mixture"])
         return AugmentAddNoise(**kwargs)
 
     def apply(self, asset: Asset, **kwargs):
         pc = asset.sampled_vertices
         assert pc is not None, "sampled_vertices is None, cannot apply AugmentAddNoise"
-        noise_std = np.random.uniform(self.noise_std_min, self.noise_std_max)
-        if self.noise_type == "laplace":
-            # 与官方 starter code 完全一致：配置值直接作为 laplace 的尺度参数 b。
-            # 官方测试集生成器与 starter code 同构，擅自换算 b=std/sqrt(2) 会造成
-            # 训练噪声比测试噪声小 sqrt(2) 倍，提交分数反而下降（已实测踩坑）
-            noise = np.random.laplace(0.0, noise_std, size=pc.shape)
-        elif self.noise_type == "gaussian":
-            noise = np.random.normal(0.0, noise_std, size=pc.shape)
+        if self.noise_mixture is not None:
+            noise, noise_type, noise_scale = sample_mixed_noise(pc.shape, self.noise_mixture)
         else:
-            raise ValueError(f"unsupported noise_type: {self.noise_type}")
+            noise_type = self.noise_type
+            noise_scale = np.random.uniform(self.noise_std_min, self.noise_std_max)
+            if noise_type == "laplace":
+                # 与官方 starter code 完全一致：配置值直接作为 laplace 的尺度参数 b。
+                # 官方测试集生成器与 starter code 同构，擅自换算 b=std/sqrt(2) 会造成
+                # 训练噪声比测试噪声小 sqrt(2) 倍，提交分数反而下降（已实测踩坑）
+                noise = np.random.laplace(0.0, noise_scale, size=pc.shape)
+            elif noise_type == "gaussian":
+                noise = np.random.normal(0.0, noise_scale, size=pc.shape)
+            else:
+                raise ValueError(f"unsupported noise_type: {noise_type}")
+        # worker 种子诊断：PCD_DEBUG_NOISE=1 时打印每个样本的 (pid, 类型, 强度)，
+        # 用于确认 DataLoader 各 worker 的 numpy 随机序列互不重复；验完去掉环境变量即可。
+        if os.environ.get("PCD_DEBUG_NOISE"):
+            print(
+                f"[noise-debug] pid={os.getpid()} type={noise_type} scale={noise_scale:.5f}",
+                flush=True,
+            )
         asset.sampled_vertices_noisy = (pc + noise).astype(np.float32, copy=False)
 
 @dataclass(frozen=True)
